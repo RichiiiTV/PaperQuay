@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/PaperQuay/PaperQuay.csproj" />
+  <Project Path="tests/PaperQuay.Checks/PaperQuay.Checks.csproj" />
+</Solution>

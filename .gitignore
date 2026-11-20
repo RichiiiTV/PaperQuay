@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+.vs/
+*.user
+/artifacts/
+*.traineddata
+/src/PaperQuay/tessdata/*.download
+*.pdf
+__pycache__/
+.env
+.env.*
