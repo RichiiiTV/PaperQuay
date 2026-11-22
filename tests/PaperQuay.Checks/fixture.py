@@ -62,7 +62,8 @@ for index, page in enumerate(pages):
             draw.text((210, 470 + line * 71), sentence, font=body_font, fill=(68, 68, 73))
     if quality and index == 4:
         draw.line((300, 1000, 800, 1000), fill=(178, 178, 178), width=6)
-    tilted = image.rotate(2.2, resample=Image.Resampling.BICUBIC, fillcolor=(220, 215, 205))
+    tilted = image if batch and not title else image.rotate(
+        2.2, resample=Image.Resampling.BICUBIC, fillcolor=(220, 215, 205))
     if quality and index in (0, 1):
         tilted = tilted.transpose(Image.Transpose.ROTATE_90 if index == 0 else Image.Transpose.ROTATE_180)
     points = (tilted.width * 72 / 400, tilted.height * 72 / 400)

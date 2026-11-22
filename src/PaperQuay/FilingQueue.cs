@@ -6,12 +6,18 @@ using NAPS2.Images;
 namespace PaperQuay;
 
 internal enum BatchPhase { Capturing, Queued, Processing, Planned, Empty, Paused }
-internal enum QueueDisposition { Review, Ready, Discarded }
+internal enum QueueDisposition { Review, Ready, Discarded, SkippedBlank }
 
-internal sealed record QueueOutput(string LocalFile, string Name, string? FiledPath = null);
+internal sealed record CaptureLayout(SheetSide Side, int Sheet);
+internal sealed record PageEdit(int Source, int? Rotation = null, bool Crop = false,
+    bool? BreakBefore = null, bool KeepBlank = false, bool Exclude = false);
+internal sealed record ReviewDraft(ProcessingOptions Processing, PageEdit[] Pages);
+
+internal sealed record QueueOutput(string LocalFile, string Name, string? FiledPath = null, string? FiledHash = null,
+    ReviewDraft? Source = null);
 internal sealed record QueueDocument(int Number, int FirstPage, int LastPage, QueueDisposition Disposition,
     string? Reason = null, QueueOutput[]? Outputs = null, int OmittedBacks = 0, int WeakOcrPages = 0,
-    int[]? ReviewOmissions = null, bool FromAutomaticPages = false, int? DecisionPage = null);
+    int[]? ReviewOmissions = null, bool FromAutomaticPages = false, int? DecisionPage = null, ReviewDraft? Draft = null);
 internal sealed record QueueBatch(Guid Id, DateTimeOffset Created, string Destination, bool Duplex,
     ProcessingOptions Processing, QuickFilingOptions Filing, int Workers)
 {
@@ -21,6 +27,8 @@ internal sealed record QueueBatch(Guid Id, DateTimeOffset Created, string Destin
     public string? TransferError { get; init; }
     public DateTimeOffset RetryAfter { get; init; }
     public DateTimeOffset? OriginalsUntil { get; init; }
+    public bool? HistoryHidden { get; init; }
+    public bool ReviewBeforeFiling { get; init; }
     public QueueDocument[] Documents { get; init; } = [];
     public bool NeedsReview => Documents.Any(doc => doc.Disposition == QueueDisposition.Review);
     public bool HasPending => Documents.Any(doc => doc.Outputs?.Any(file => file.FiledPath is null) == true);
@@ -31,10 +39,15 @@ internal sealed record QueueBatch(Guid Id, DateTimeOffset Created, string Destin
 // Queue state is advanced on the UI thread. Workers only process immutable batch snapshots and files.
 internal sealed partial class FilingQueue : IDisposable
 {
+    private sealed record CaptureCompletion(string? Error, ReviewDraft? Draft);
     private readonly string root;
     private readonly FileStream ownership;
     private readonly Dictionary<Guid, QueueBatch> batches = [];
+    private readonly Dictionary<Guid, (QueueBatch Batch, DateTimeOffset RetryAt)> preparationSaves = [];
+    private readonly HashSet<Guid> hiddenHistory = [];
     private DateTimeOffset nextPrune;
+    private static readonly TimeSpan OriginalRetention = TimeSpan.FromDays(7);
+    private static readonly TimeSpan FinishedCacheRetention = TimeSpan.FromHours(1);
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true, IgnoreReadOnlyProperties = true };
     public string? RecoveryMessage { get; private set; }
 
@@ -59,6 +72,7 @@ internal sealed partial class FilingQueue : IDisposable
                     continue;
                 try
                 {
+                    CheckBatchDirectory(directory);
                     var batch = JsonSerializer.Deserialize<QueueBatch>(File.ReadAllText(Manifest(id)), Json);
                     if (batch?.Id != id || string.IsNullOrWhiteSpace(batch.Destination) ||
                         !Path.IsPathFullyQualified(batch.Destination) || batch.Documents is null ||
@@ -66,9 +80,9 @@ internal sealed partial class FilingQueue : IDisposable
                         throw new InvalidDataException("Invalid batch record.");
                     batches.Add(id, batch);
                     if (batch.Phase == BatchPhase.Capturing)
-                        FinishCapture(id, "The app closed during capture. Check that all pages are present.");
+                        RecoverCapture(id);
                     else if (batch.Phase == BatchPhase.Processing)
-                        Store(batch with { Phase = BatchPhase.Queued });
+                        SavePreparation(batch with { Phase = BatchPhase.Queued });
                     else if (batch.Phase == BatchPhase.Planned)
                     {
                         if (CanRecheckLegacy(batch))
@@ -84,6 +98,16 @@ internal sealed partial class FilingQueue : IDisposable
                     RecoveryMessage = "A batch record could not be read. Its files were kept in the local queue.";
                 }
             }
+            try
+            {
+                hiddenHistory = JsonSerializer.Deserialize<HashSet<Guid>>(
+                    File.ReadAllText(Path.Combine(this.root, "hidden-history.json")), Json) ?? [];
+            }
+            catch (FileNotFoundException) { }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            {
+                RecoveryMessage ??= "The saved history view could not be read. All scan records are visible.";
+            }
         }
         catch
         {
@@ -93,7 +117,80 @@ internal sealed partial class FilingQueue : IDisposable
     }
 
     public IEnumerable<QueueBatch> Batches => batches.Values.OrderByDescending(batch => batch.Created);
+    public IEnumerable<QueueBatch> History => Batches.Where(batch => !(batch.HistoryHidden ?? hiddenHistory.Contains(batch.Id)));
     public QueueBatch Get(Guid id) => batches[id];
+
+    public async Task<(int Failed, string? Error)> ClearHistory(QueueBatch[] history)
+    {
+        var failed = 0;
+        string? error = null;
+        foreach (var batch in history)
+        {
+            var files = batch.Documents.SelectMany(doc => doc.Outputs ?? []).Where(file => file.FiledPath is not null).ToArray();
+            var deleted = new HashSet<QueueOutput>();
+            if (files.Length > 0)
+            {
+                await Task.Run(() =>
+                {
+                    foreach (var file in files)
+                    {
+                        try
+                        {
+                            DeleteFiledPdf(batch.Id, file);
+                            deleted.Add(file);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                            InvalidDataException or NotSupportedException)
+                        {
+                            failed++;
+                            error ??= $"{file.Name}. {ex.Message}";
+                        }
+                    }
+                });
+            }
+            var current = Get(batch.Id);
+            var documents = current.Documents.Select(doc => doc with
+            {
+                Outputs = doc.Outputs?.Where(file => !deleted.Contains(file)).ToArray()
+            }).ToArray();
+            try
+            {
+                Store(current with
+                {
+                    Documents = documents,
+                    HistoryHidden = !documents.Any(doc => doc.Outputs?.Any(file => file.FiledPath is not null) == true)
+                });
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                failed++;
+                error ??= $"Couldn't save the updated batch record. {ex.Message}";
+            }
+        }
+        return (failed, error);
+    }
+
+    private static void DeleteFiledPdf(Guid id, QueueOutput file)
+    {
+        var path = file.FiledPath!;
+        var name = SafeFileName(file.Name);
+        if (!Path.IsPathFullyQualified(path) || !string.Equals(Path.GetFileName(path), name, StringComparison.OrdinalIgnoreCase) ||
+            !name.StartsWith("Scan ", StringComparison.Ordinal) || !name.Contains($" {id.ToString("N")[..8]} - ", StringComparison.Ordinal))
+            throw new IOException("The recorded path does not match this scan.");
+        try
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("The saved PDF path now points to a link.");
+            if (file.FiledHash is { } expected)
+            {
+                using var input = File.OpenRead(path);
+                if (Convert.ToHexString(SHA256.HashData(input)) != expected)
+                    throw new IOException("The PDF has changed since it was saved.");
+            }
+            File.Delete(path);
+        }
+        catch (FileNotFoundException) { }
+    }
 
     public bool CanReprocess(QueueBatch batch) => batch.IsFinished && HasOriginals(batch, 1, batch.Pages);
 
@@ -107,9 +204,15 @@ internal sealed partial class FilingQueue : IDisposable
         var now = DateTimeOffset.UtcNow;
         if (nextPrune > now) return;
         nextPrune = now.AddHours(1);
-        foreach (var batch in batches.Values)
-            if (batch.Id != inUse && batch.OriginalsUntil is { } expiry && expiry <= now)
-                ReleaseFinished(batch);
+        foreach (var batch in batches.Values.Where(batch => batch.Id != inUse &&
+                     batch.OriginalsUntil is { } expiry && !KeepFinishedCache(expiry, now)).ToArray())
+        {
+            try { ReleaseFinished(batch); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                RecoveryMessage = "Some retained scan files could not be cleaned up.";
+            }
+        }
     }
 
     private bool CanRecheckLegacy(QueueBatch batch) =>
@@ -122,16 +225,27 @@ internal sealed partial class FilingQueue : IDisposable
         Enumerable.Range(1, batch.Pages).All(page => File.Exists(Original(batch.Id, page)));
 
     public QueueBatch Begin(string destination, bool duplex, ProcessingOptions processing,
-        QuickFilingOptions filing, int workers)
+        QuickFilingOptions filing, int workers, bool reviewBeforeFiling = false)
     {
         var batch = new QueueBatch(Guid.NewGuid(), DateTimeOffset.Now, Path.GetFullPath(destination),
-            duplex, processing, filing, Math.Clamp(workers, 1, 4));
+            duplex, processing, filing, Math.Clamp(workers, 1, 4)) { ReviewBeforeFiling = reviewBeforeFiling };
         Directory.CreateDirectory(Folder(batch.Id));
         Store(batch);
         return batch;
     }
 
-    public void StorePage(Guid id, int page, Bitmap image)
+    public QueueBatch AppendReview(Guid id)
+    {
+        var batch = Get(id);
+        if (!batch.ReviewBeforeFiling || batch.Phase != BatchPhase.Planned || !batch.NeedsReview || batch.HasPending)
+            throw new InvalidOperationException("This batch is no longer accepting review pages.");
+        File.Delete(CompletionPath(id));
+        batch = batch with { Phase = BatchPhase.Capturing };
+        Store(batch);
+        return batch;
+    }
+
+    public void StorePage(Guid id, int page, Bitmap image, CaptureLayout? layout = null)
     {
         var path = Original(id, page);
         var temporary = path + ".tmp";
@@ -142,32 +256,56 @@ internal sealed partial class FilingQueue : IDisposable
                 image.Save(stream, ImageFormat.Png);
                 stream.Flush(flushToDisk: true);
             }
+            if (layout is not null) WriteRecord(LayoutPath(id, page), layout);
             File.Move(temporary, path);
         }
         finally
         {
-            File.Delete(temporary);
+            TryDelete(temporary);
         }
     }
 
-    public QueueBatch FinishCapture(Guid id, string? error = null)
+    private void RecoverCapture(Guid id)
+    {
+        var completion = new CaptureCompletion("The app closed during capture. Check that all pages are present.", null);
+        var path = CompletionPath(id);
+        try
+        {
+            if (File.Exists(path) && JsonSerializer.Deserialize<CaptureCompletion>(File.ReadAllText(path), Json) is { } saved)
+                completion = saved;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { }
+        FinishCapture(id, completion.Error, draft: completion.Draft);
+    }
+
+    public QueueBatch FinishCapture(Guid id, string? error = null, int? duplexStart = null, ReviewDraft? draft = null)
     {
         var batch = Get(id);
         var pages = Directory.EnumerateFiles(Folder(id), "page-*.png").Count();
-        if (batch.Duplex && pages % 2 != 0)
+        if ((!batch.ReviewBeforeFiling && batch.Duplex && pages % 2 != 0) ||
+            (duplexStart is { } start && (pages - start) % 2 != 0))
             error ??= "The scanner returned an odd number of sides in duplex mode. Check for the missing side.";
+        var needsReview = pages > 0 && (error is not null || batch.ReviewBeforeFiling);
+        if (draft is null && batch.ReviewBeforeFiling && batch.Documents.FirstOrDefault()?.Draft is { } saved)
+            draft = saved with { Pages = [.. saved.Pages, .. Enumerable.Range(batch.Pages + 1, Math.Max(0, pages - batch.Pages))
+                .Select(page => new PageEdit(page))] };
         var updated = batch with
         {
             Pages = pages, ScanError = error,
-            Phase = pages == 0 ? BatchPhase.Empty : error is null ? BatchPhase.Queued : BatchPhase.Planned,
-            Documents = pages > 0 && error is not null
-                ? [new QueueDocument(1, 1, pages, QueueDisposition.Review, error)] : []
+            Phase = pages == 0 ? BatchPhase.Empty : needsReview ? BatchPhase.Planned : BatchPhase.Queued,
+            Documents = needsReview
+                ? [new QueueDocument(1, 1, pages, QueueDisposition.Review, error ?? "Review this batch before filing.", Draft: draft)] : []
         };
-        Store(updated);
+        if (!SavePreparation(updated))
+        {
+            try { WriteRecord(CompletionPath(id), new CaptureCompletion(error, draft)); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
         return updated;
     }
 
-    public QueueBatch? NextPreparation() => Batches.Reverse().FirstOrDefault(batch => batch.Phase == BatchPhase.Queued);
+    public QueueBatch? NextPreparation() => Batches.Reverse().FirstOrDefault(batch =>
+        batch.Phase == BatchPhase.Queued && !IsSavingPreparation(batch.Id));
 
     public void Resume(Guid id)
     {
@@ -196,24 +334,59 @@ internal sealed partial class FilingQueue : IDisposable
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(shutdown, pause);
         var token = cancellation.Token;
         Store(batch with { Phase = BatchPhase.Processing });
+        QueueBatch result;
         try
         {
             // A dedicated context keeps scanner capture independent of queued imports, rendering and OCR.
             var documents = await Task.Run(() => Analyze(batch, progress, stage, token), token);
-            Store(Get(id) with { Phase = BatchPhase.Planned, Documents = documents });
+            result = Get(id) with
+            {
+                Phase = BatchPhase.Planned, Documents = documents,
+                OriginalsUntil = documents.All(doc => doc.Disposition == QueueDisposition.SkippedBlank)
+                    ? DateTimeOffset.UtcNow + OriginalRetention : null
+            };
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
-            Store(Get(id) with { Phase = pause.IsCancellationRequested ? BatchPhase.Paused : BatchPhase.Queued });
+            result = Get(id) with { Phase = pause.IsCancellationRequested ? BatchPhase.Paused : BatchPhase.Queued };
         }
         catch (Exception ex)
         {
-            Store(Get(id) with
+            result = Get(id) with
             {
                 Phase = BatchPhase.Planned,
                 Documents = [new QueueDocument(1, 1, batch.Pages, QueueDisposition.Review,
                     $"Batch processing stopped. {ex.Message}")]
-            });
+            };
+        }
+        SavePreparation(result);
+    }
+
+    public bool IsSavingPreparation(Guid id) => preparationSaves.ContainsKey(id);
+
+    public bool RetryPreparationSaves(Guid? immediately = null)
+    {
+        var changed = false;
+        foreach (var pending in preparationSaves.Values.ToArray())
+            if (immediately == pending.Batch.Id ||
+                (immediately is null && pending.RetryAt <= DateTimeOffset.UtcNow))
+                changed |= SavePreparation(pending.Batch with { HistoryHidden = Get(pending.Batch.Id).HistoryHidden });
+        return changed;
+    }
+
+    private bool SavePreparation(QueueBatch batch)
+    {
+        try
+        {
+            Store(batch);
+            preparationSaves.Remove(batch.Id);
+            TryDelete(CompletionPath(batch.Id));
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            preparationSaves[batch.Id] = (batch, DateTimeOffset.UtcNow.AddSeconds(3));
+            return false;
         }
     }
 
@@ -245,14 +418,21 @@ internal sealed partial class FilingQueue : IDisposable
             foreach (var doc in drafts)
             {
                 token.ThrowIfCancellationRequested();
-                staged.Add(doc.Plan.ReviewReason is not null
-                    ? new QueueDocument(doc.Number, doc.First, doc.Last, QueueDisposition.Review, doc.Plan.ReviewReason,
-                        OmittedBacks: doc.Plan.OmittedBacks, ReviewOmissions: doc.ExcludedPages,
-                        FromAutomaticPages: true, DecisionPage: doc.DecisionPage)
-                    : Stage(batch, new QueueDocument(doc.Number, doc.First, doc.Last, QueueDisposition.Ready,
-                            WeakOcrPages: doc.Plan.WeakOcrPages, ReviewOmissions: doc.ExcludedPages,
-                            FromAutomaticPages: true),
-                        doc.Plan.Documents, doc.Plan.OmittedBacks, token));
+                var document = new QueueDocument(doc.Number, doc.First, doc.Last, QueueDisposition.Review,
+                    doc.Plan.ReviewReason, OmittedBacks: doc.Plan.OmittedBacks, WeakOcrPages: doc.Plan.WeakOcrPages,
+                    ReviewOmissions: doc.ExcludedPages, FromAutomaticPages: true, DecisionPage: doc.DecisionPage);
+                if (doc.Plan.ReviewReason is not null)
+                    staged.Add(document);
+                else if (doc.Plan.Documents.Length == 0)
+                    staged.Add(document with { Disposition = QueueDisposition.SkippedBlank, FromAutomaticPages = false,
+                        Reason = "All captured pages were empty. No PDF was created." });
+                else
+                {
+                    var source = Enumerable.Range(doc.First, doc.Last - doc.First + 1).Except(doc.ExcludedPages ?? [])
+                        .Select(number => new PageEdit(number, pages[number - 1].Orientation, KeepBlank: true)).ToArray();
+                    staged.Add(Stage(batch, document, doc.Plan.Documents, doc.Plan.OmittedBacks, token,
+                        [new ReviewDraft(batch.Processing, source)]));
+                }
             }
             return staged.ToArray();
         }
@@ -269,10 +449,13 @@ internal sealed partial class FilingQueue : IDisposable
     }
 
     private QueueDocument Stage(QueueBatch batch, QueueDocument document, PreparedPage[][] sets,
-        int omitted, CancellationToken token)
+        int omitted, CancellationToken token, ReviewDraft[]? sources)
     {
         if (sets.Length == 0 || sets.Any(set => set.Length == 0))
             throw new InvalidOperationException("There are no pages to file.");
+        if (sources is not null && (sources.Length != sets.Length ||
+            sources.Where((source, index) => source.Pages.Length != sets[index].Length).Any()))
+            throw new InvalidOperationException("The saved page selections do not match the PDFs.");
         var files = new List<QueueOutput>();
         try
         {
@@ -281,7 +464,7 @@ internal sealed partial class FilingQueue : IDisposable
                 token.ThrowIfCancellationRequested();
                 var name = $"Scan {batch.Created:yyyy-MM-dd HHmmss} {batch.Id.ToString("N")[..8]} - {document.Number:D2}";
                 if (sets.Length > 1) name += $"-{index + 1:D2}";
-                var output = new QueueOutput($"file-{Guid.NewGuid():N}.pdf", name + ".pdf");
+                var output = new QueueOutput($"file-{Guid.NewGuid():N}.pdf", name + ".pdf", Source: sources?[index]);
                 files.Add(output);
                 DocumentEngine.Merge(SpoolFile(batch.Id, output.LocalFile), sets[index], token);
             }
@@ -295,20 +478,36 @@ internal sealed partial class FilingQueue : IDisposable
         }
     }
 
-    public async Task Approve(Guid id, int number, PreparedPage[][] sets, CancellationToken token)
+    public void SaveDraft(Guid id, int number, ReviewDraft draft)
+    {
+        var batch = Get(id);
+        var document = batch.Documents.Single(doc => doc.Number == number && doc.Disposition == QueueDisposition.Review);
+        Store(batch with { Documents = Replace(batch.Documents, document with { Draft = draft }) });
+    }
+
+    public async Task Approve(Guid id, int number, PreparedPage[][] sets, CancellationToken token, int? omitted = null,
+        ReviewDraft[]? sources = null)
     {
         var batch = Get(id);
         var document = batch.Documents.Single(doc => doc.Number == number && doc.Disposition == QueueDisposition.Review);
         var ready = await Task.Run(() => Stage(batch, document with
         {
-            ReviewOmissions = null, FromAutomaticPages = false, DecisionPage = null
-        }, sets, document.OmittedBacks, token), token);
+            ReviewOmissions = null, FromAutomaticPages = false, DecisionPage = null, Draft = null
+        }, sets, omitted ?? document.OmittedBacks, token, sources), token);
         var current = Get(id);
-        Store(current with
+        try
         {
-            Documents = Replace(current.Documents, ready),
-            RetryAfter = DateTimeOffset.MinValue
-        });
+            Store(current with
+            {
+                Documents = Replace(current.Documents, ready),
+                RetryAfter = DateTimeOffset.MinValue
+            });
+        }
+        catch
+        {
+            foreach (var file in ready.Outputs!) TryDelete(SpoolFile(id, file.LocalFile));
+            throw;
+        }
     }
 
     public void Discard(Guid id, int number)
@@ -317,14 +516,19 @@ internal sealed partial class FilingQueue : IDisposable
         var document = current.Documents.Single(doc => doc.Number == number && doc.Disposition == QueueDisposition.Review);
         var updated = current with
         {
-            Documents = Replace(current.Documents, document with { Disposition = QueueDisposition.Discarded })
+            Documents = Replace(current.Documents, document with { Disposition = QueueDisposition.Discarded, Draft = null })
         };
         Store(updated);
         ReleaseFinished(updated);
     }
 
-    public QueueBatch? NextTransfer() => Batches.Reverse().FirstOrDefault(batch =>
-        batch.HasPending && batch.RetryAfter <= DateTimeOffset.Now);
+    public QueueBatch? NextTransfer(IReadOnlySet<Guid>? active = null, Guid? changingDestination = null)
+    {
+        var destinations = (active ?? new HashSet<Guid>()).Select(id => Path.TrimEndingDirectorySeparator(Get(id).Destination))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return Batches.Reverse().FirstOrDefault(batch => batch.HasPending && batch.RetryAfter <= DateTimeOffset.Now &&
+            batch.Id != changingDestination && !destinations.Contains(Path.TrimEndingDirectorySeparator(batch.Destination)));
+    }
 
     public async Task Transfer(Guid id, CancellationToken token)
     {
@@ -337,14 +541,14 @@ internal sealed partial class FilingQueue : IDisposable
             var destination = Path.Combine(batch.Destination, SafeFileName(file.Name));
             try
             {
-                await Task.Run(() => Publish(SpoolFile(id, file.LocalFile), destination, token), token);
+                var hash = await Task.Run(() => Publish(SpoolFile(id, file.LocalFile), destination, token), token);
                 var current = Get(id);
                 var group = current.Documents.Single(doc => doc.Number == number);
                 var filed = group with { Outputs = group.Outputs!.Select(item =>
-                    item.LocalFile == file.LocalFile ? item with { FiledPath = destination } : item).ToArray() };
+                    item.LocalFile == file.LocalFile ? item with { FiledPath = destination, FiledHash = hash } : item).ToArray() };
                 Store(current with
                 {
-                    Documents = Replace(current.Documents, filed), TransferError = null,
+                    Documents = Replace(current.Documents, filed), TransferError = null, HistoryHidden = false,
                     RetryAfter = DateTimeOffset.MinValue
                 });
             }
@@ -363,13 +567,15 @@ internal sealed partial class FilingQueue : IDisposable
         ReleaseFinished(Get(id));
     }
 
-    internal static void Publish(string localFile, string destination, CancellationToken token)
+    internal static string Publish(string localFile, string destination, CancellationToken token)
     {
-        bool ExistingMatches()
+        string? MatchingHash()
         {
             using var source = File.OpenRead(localFile);
             using var existing = File.OpenRead(destination);
-            return source.Length == existing.Length && SHA256.HashData(source).SequenceEqual(SHA256.HashData(existing));
+            if (source.Length != existing.Length) return null;
+            var hash = SHA256.HashData(source);
+            return hash.SequenceEqual(SHA256.HashData(existing)) ? Convert.ToHexString(hash) : null;
         }
 
         token.ThrowIfCancellationRequested();
@@ -377,15 +583,16 @@ internal sealed partial class FilingQueue : IDisposable
             $".scan-{Path.GetFileNameWithoutExtension(localFile)}.tmp");
         if (File.Exists(destination))
         {
-            if (ExistingMatches())
+            if (MatchingHash() is { } existingHash)
             {
                 TryDelete(temporary);
-                return;
+                return existingHash;
             }
             throw new IOException("A different PDF already has the target name. Choose another folder or resolve the conflict.");
         }
         try
         {
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             using (var source = File.OpenRead(localFile))
             // The stable staging name lets a retry replace its own incomplete copy after a crash.
             using (var target = new FileStream(temporary, FileMode.Create, FileAccess.Write))
@@ -395,13 +602,15 @@ internal sealed partial class FilingQueue : IDisposable
                 while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
                 {
                     token.ThrowIfCancellationRequested();
+                    hash.AppendData(buffer, 0, read);
                     target.Write(buffer, 0, read);
                 }
                 target.Flush(flushToDisk: true);
             }
             token.ThrowIfCancellationRequested();
             try { File.Move(temporary, destination); }
-            catch (IOException) when (File.Exists(destination) && ExistingMatches()) { }
+            catch (IOException) when (File.Exists(destination) && MatchingHash() is not null) { }
+            return Convert.ToHexString(hash.GetHashAndReset());
         }
         finally
         {
@@ -422,8 +631,7 @@ internal sealed partial class FilingQueue : IDisposable
         if (batch.Phase is BatchPhase.Capturing or BatchPhase.Processing)
             throw new InvalidOperationException("Stop this batch before removing it.");
         var folder = Folder(id);
-        if ((File.GetAttributes(folder) & FileAttributes.ReparsePoint) != 0)
-            throw new IOException("This batch folder points outside the queue.");
+        CheckBatchDirectory(folder);
         var removed = Path.Combine(root, ".removed-" + id.ToString("N"));
         Directory.Move(folder, removed);
         batches.Remove(id);
@@ -447,8 +655,20 @@ internal sealed partial class FilingQueue : IDisposable
     }
 
     public string Original(Guid id, int number) => Path.Combine(Folder(id), $"page-{number:D6}.png");
+    public CaptureLayout PageLayout(QueueBatch batch, int number)
+    {
+        var path = LayoutPath(batch.Id, number);
+        if (batch.ReviewBeforeFiling && File.Exists(path))
+            return JsonSerializer.Deserialize<CaptureLayout>(File.ReadAllText(path), Json) ??
+                throw new InvalidDataException($"The scan-side record for page {number} is invalid.");
+        return batch.Duplex ? new CaptureLayout(number % 2 == 0 ? SheetSide.Back : SheetSide.Front, (number + 1) / 2) :
+            new CaptureLayout(SheetSide.Unpaired, number);
+    }
+
     private string Folder(Guid id) => Path.Combine(root, id.ToString("N"));
     private string Manifest(Guid id) => Path.Combine(Folder(id), "batch.json");
+    private string CompletionPath(Guid id) => Path.Combine(Folder(id), "capture-complete.json");
+    private string LayoutPath(Guid id, int number) => Original(id, number) + ".layout.json";
     private string SpoolFile(Guid id, string file) => Path.Combine(Folder(id), SafeFileName(file));
     private static string SafeFileName(string file) =>
         file.Length > 0 && Path.GetFileName(file) == file && file.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)
@@ -456,17 +676,21 @@ internal sealed partial class FilingQueue : IDisposable
 
     private void Store(QueueBatch batch)
     {
-        var manifest = Manifest(batch.Id);
-        var temporary = manifest + $".{Guid.NewGuid():N}.tmp";
+        WriteRecord(Manifest(batch.Id), batch);
+        batches[batch.Id] = batch;
+    }
+
+    private static void WriteRecord<T>(string path, T record)
+    {
+        var temporary = path + $".{Guid.NewGuid():N}.tmp";
         try
         {
             using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write))
             {
-                JsonSerializer.Serialize(stream, batch, Json);
+                JsonSerializer.Serialize(stream, record, Json);
                 stream.Flush(flushToDisk: true);
             }
-            File.Move(temporary, manifest, overwrite: true);
-            batches[batch.Id] = batch;
+            File.Move(temporary, path, overwrite: true);
         }
         finally
         {
@@ -478,19 +702,34 @@ internal sealed partial class FilingQueue : IDisposable
     {
         if (batch.Phase != BatchPhase.Planned || !batch.IsFinished)
             return;
-        if (batch.FiledCount > 0 && batch.OriginalsUntil is null && File.Exists(Original(batch.Id, 1)))
+        var folder = Folder(batch.Id);
+        CheckBatchDirectory(folder);
+        if ((batch.FiledCount > 0 || batch.Documents.Any(doc => doc.Disposition == QueueDisposition.SkippedBlank)) &&
+            batch.OriginalsUntil is null && File.Exists(Original(batch.Id, 1)))
         {
-            batch = batch with { OriginalsUntil = DateTimeOffset.UtcNow.AddDays(7) };
+            batch = batch with { OriginalsUntil = DateTimeOffset.UtcNow + OriginalRetention };
             Store(batch);
         }
-        var keepOriginals = batch.OriginalsUntil > DateTimeOffset.UtcNow;
-        foreach (var file in Directory.EnumerateFiles(Folder(batch.Id)))
+        var now = DateTimeOffset.UtcNow;
+        var keepOriginals = batch.OriginalsUntil > now;
+        var keepCache = batch.OriginalsUntil is { } expiry && KeepFinishedCache(expiry, now);
+        foreach (var file in Directory.EnumerateFiles(folder))
         {
             var name = Path.GetFileName(file);
-            if (name != "batch.json" && !(keepOriginals && (name.StartsWith(CachePrefix, StringComparison.Ordinal) ||
-                (name.StartsWith("page-", StringComparison.Ordinal) && name.EndsWith(".png", StringComparison.Ordinal)))))
+            if (name != "batch.json" && !(keepCache && name.StartsWith(CachePrefix, StringComparison.Ordinal)) &&
+                !(keepOriginals && name.StartsWith("page-", StringComparison.Ordinal) &&
+                    (name.EndsWith(".png", StringComparison.Ordinal) || name.EndsWith(".png.layout.json", StringComparison.Ordinal))))
                 TryDelete(file);
         }
+    }
+
+    private static bool KeepFinishedCache(DateTimeOffset originalsExpire, DateTimeOffset now) =>
+        originalsExpire > now + OriginalRetention - FinishedCacheRetention;
+
+    private static void CheckBatchDirectory(string folder)
+    {
+        if ((File.GetAttributes(folder) & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("This batch folder points outside the queue.");
     }
 
     private static QueueDocument[] Replace(QueueDocument[] documents, QueueDocument replacement) =>

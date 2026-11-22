@@ -7,8 +7,13 @@ if (args is ["--check-duplex-pair", var pairFolder])
 {
     using var first = new Bitmap(Path.Combine(pairFolder, "page-000001.png"));
     using var second = new Bitmap(Path.Combine(pairFolder, "page-000002.png"));
-    Console.WriteLine($"Show-through on first side: {ScanImageEvidence.IsShowThrough(second, first)}");
-    Console.WriteLine($"Show-through on second side: {ScanImageEvidence.IsShowThrough(first, second)}");
+    Console.WriteLine($"First side: {ScanImageEvidence.InspectReverse(second, first, detectShowThrough: true)}");
+    Console.WriteLine($"Second side: {ScanImageEvidence.InspectReverse(first, second, detectShowThrough: true)}");
+    return;
+}
+if (args is ["--check-retained-batch", var retainedBatch])
+{
+    await ScanImageChecks.CheckRetainedBatch(retainedBatch);
     return;
 }
 if (args is ["--live-quality", var localFolder])
@@ -44,6 +49,21 @@ if (args is ["--driver", var route, var operation])
     await DriverCheck.Run(route, operation);
     return;
 }
+if (args is ["--paper-sizes"])
+{
+    DriverCheck.VerifyPaperSizes();
+    return;
+}
+if (args is ["--feeder-recovery", var feederFolder])
+{
+    await DriverCheck.VerifyFeederRecovery(feederFolder);
+    return;
+}
+if (args is ["--live-queue-click", var clickFolder])
+{
+    await DriverCheck.VerifyColdQueueClick(clickFolder);
+    return;
+}
 if (args.Length == 2 && args[0] is "--perf" or "--perf-live")
 {
     await PerformanceCheck.Run(args[1], live: args[0] == "--perf-live");
@@ -57,6 +77,13 @@ if (args is ["--perf-stack", var stackFolder, var mode])
 if (args is ["--queue", var workspace, var batchFixture, var reviewFixture])
 {
     await QueueChecks.Run(workspace, batchFixture, reviewFixture);
+    return;
+}
+if (args is ["--check-queue-junction", var junctionQueue])
+{
+    using var queue = new FilingQueue(junctionQueue);
+    if (queue.Batches.Any() || queue.RecoveryMessage is null)
+        throw new InvalidOperationException("A redirected queue batch was accepted.");
     return;
 }
 if (args is ["--queue-preview", var queueFolder])
@@ -186,41 +213,42 @@ if (args is ["--batch", var batchPath, var outDir])
         Directory.CreateDirectory(outDir);
         var sets = results.Select((page, index) => (Page: page!, grouped[index].Number))
             .GroupBy(entry => entry.Number).Select(group => group.Select(item => item.Page).ToArray()).ToArray();
-        OutputFolder.Export(outDir, sets, CancellationToken.None);
-        var quickPages = results.Select((page, index) => new QuickPage(
-            page! with { OmitSide = input[index].Side == SheetSide.Back && input[index].Clues.Blank }, input[index].Side,
-            grouped[index].Number)).ToArray();
-        var quick = QuickFiling.Plan(quickPages, new QuickFilingOptions(DetectDocuments: true));
-        if (quick.ReviewReason is not null || quick.OmittedBacks != 4 ||
-            !quick.Documents.Select(document => document.Length).SequenceEqual(new[] { 2, 2, 1 }))
-            throw new Exception("Automatic filing did not keep the document order and omit only blank backs.");
-        var keepAll = QuickFiling.Plan(quickPages, new QuickFilingOptions(SkipBlankBacks: false));
+        await QueueChecks.ExportFixture(outDir, sets);
+        var quickPages = results.Select(page => page!).ToArray();
+        FilingPlan Plan(PreparedPage[] pages, QuickFilingOptions settings)
+        {
+            var kept = pages.Where(page => !settings.Omits(page)).ToArray();
+            return QuickFiling.Plan(kept, pages.Length - kept.Length, settings.DetectByContent, 1);
+        }
+        var quick = sets.Select(set => Plan(set, new(DetectDocuments: true))).ToArray();
+        var quickDocuments = quick.SelectMany(plan => plan.Documents).ToArray();
+        if (quick.Any(plan => plan.ReviewReason is not null) || quick.Sum(plan => plan.OmittedBacks) != 5 ||
+            !quickDocuments.Select(document => document.Length).SequenceEqual(new[] { 2, 1, 1 }))
+            throw new Exception("Automatic filing did not keep the document order and omit both sides of the blank separator.");
+        var keepAll = Plan(quickPages, new(SkipBlankBacks: false));
         if (keepAll.ReviewReason is not null || keepAll.Documents.Length != 1 || keepAll.Documents[0].Length != images.Count)
             throw new Exception("One PDF per load did not keep the entire batch.");
-        var incomplete = QuickFiling.Plan([quickPages[0], quickPages[1]], new QuickFilingOptions(DetectDocuments: true));
+        var incomplete = Plan([quickPages[0], quickPages[1]], new(DetectDocuments: true));
         if (incomplete.ReviewReason is null || incomplete.Documents.Length != 0)
             throw new Exception("An incomplete numbered document was filed automatically.");
-        var weak = quickPages[0] with
-        {
-            Page = quickPages[0].Page with { Quality = new OcrQuality(13, 55) }
-        };
-        var weakPlan = QuickFiling.Plan([weak], new());
+        var weak = quickPages[0] with { Quality = new OcrQuality(13, 55) };
+        var weakPlan = Plan([weak], new());
         if (weakPlan.ReviewReason is not null || weakPlan.WeakOcrPages != 1 ||
-            weakPlan.Documents.Single().Single() != weak.Page)
+            weakPlan.Documents.Single().Single() != weak)
             throw new Exception("Weak OCR blocked filing or lost the page or warning.");
-        var unnumberedPages = quickPages.Where(page => !page.Page.Clues.Blank).Take(2)
-            .Select(page => page with { Page = page.Page with
-                { Clues = page.Page.Clues with { Number = null, Total = null } } }).ToArray();
-        var unnumberedPlan = QuickFiling.Plan(unnumberedPages, new(DetectDocuments: true));
+        var unnumberedPages = quickPages.Where(page => !page.Clues.Blank).Take(2)
+            .Select(page => page with { Clues = page.Clues with { Number = null, Total = null } }).ToArray();
+        var unnumberedPlan = Plan(unnumberedPages, new(DetectDocuments: true));
         if (unnumberedPlan.ReviewReason is not null || unnumberedPlan.Documents.Single().Length != 2)
             throw new Exception("An ordinary unnumbered document was stopped or split.");
-        if (QuickFiling.Plan([quickPages[1]], new()).ReviewReason is null ||
-            QuickFiling.Plan([], new()).ReviewReason is null)
-            throw new Exception("Quick filing accepted an entirely blank or empty batch.");
+        var entirelyBlank = Plan([quickPages[1]], new());
+        if (entirelyBlank is not { ReviewReason: null, Documents.Length: 0, OmittedBacks: 1 } ||
+            Plan([], new()).ReviewReason is null)
+            throw new Exception("Quick filing did not distinguish skipped blank pages from a missing capture.");
         var quickDir = Path.Combine(outDir, "quick");
         Directory.CreateDirectory(quickDir);
-        OutputFolder.Export(quickDir, quick.Documents, CancellationToken.None);
-        Console.WriteLine("Verified quick filing, blank-back omission, and review stops.");
+        await QueueChecks.ExportFixture(quickDir, quickDocuments);
+        Console.WriteLine("Verified quick filing, empty-page removal, and review stops.");
         return;
     }
     finally
@@ -333,7 +361,7 @@ try
         }
         var batchDir = Path.Combine(Path.GetDirectoryName(output)!, "batch");
         Directory.CreateDirectory(batchDir);
-        OutputFolder.Export(batchDir, [[allPrepared[0]], [allPrepared[1]]], CancellationToken.None);
+        await QueueChecks.ExportFixture(batchDir, [[allPrepared[0]], [allPrepared[1]]]);
         if (Directory.GetFiles(batchDir, "*.pdf").Length != 2 || Directory.GetFiles(batchDir, "*.tmp").Length != 0)
             throw new Exception("The batch did not publish exactly two PDFs.");
     }

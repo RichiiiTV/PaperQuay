@@ -9,35 +9,39 @@ internal sealed partial class Workbench
     private readonly FilingQueue filingQueue;
     private readonly System.Windows.Forms.Timer queueTimer = new() { Interval = 3000 };
     private readonly CancellationTokenSource queueLifetime = new();
-    private readonly ListView batchList = QueueList("Scan batches", ("Batch", 155), ("Pages", 70),
-        ("Status", 163), ("Filed PDFs", 90), ("Destination", 510));
-    private readonly ListView documentList = QueueList("Documents in selected batch", ("Document", 97),
-        ("Pages", 72), ("Status", 155), ("PDF or review reason", 630));
+    private readonly ListView batchList = QueueList("Scan batches", ("Scanned", 111), ("Sides", 47), ("Status", 112));
+    private readonly ListView documentList = QueueList("Documents in selected batch", ("Doc", 46),
+        ("Pages", 53), ("Status", 112), ("File or review reason", 250));
+    private readonly Label emptyBatches = EmptyList();
+    private readonly Label emptyDocuments = EmptyList();
     private readonly Label batchDetails = Caption("Scanned batches will appear here.");
     private Button reviewQueued = null!;
     private Button reviewNext = null!;
     private Button openQueued = null!;
     private Button openDestination = null!;
-    private Button retryDelivery = null!;
-    private Button redirectDelivery = null!;
+    private Button clearHistory = null!;
+    private ToolStripMenuItem retryDelivery = null!;
+    private ToolStripMenuItem redirectDelivery = null!;
     private Button discardQueued = null!;
-    private Button stopPreparation = null!;
-    private Button removeBatch = null!;
-    private Button clearFinished = null!;
-    private Button reprocess = null!;
+    private ToolStripMenuItem stopPreparation = null!;
+    private ToolStripMenuItem removeBatch = null!;
+    private ToolStripMenuItem clearFinished = null!;
+    private ToolStripMenuItem reprocess = null!;
+    private Button batchMenuButton = null!;
     private bool updatingQueue;
+    private bool clearingHistory;
     private Guid? lastQueuedSelection;
     private (Guid Id, CancellationTokenSource Stop)? preparing;
     private int preparedPages;
     private long preparationStarted;
     private string preparationStage = "Recognizing";
-    private Guid? transferring;
+    private readonly HashSet<Guid> transferring = [];
     private Guid? choosingNewDestination;
     private (Guid Batch, int Document)? reviewing;
     private Guid? reprocessing;
     private (Guid Id, QueueDocument Document)? automaticReview;
     private Button? restoreSides;
-    private bool ShowingQueue => activeScreen is Screen.History or Screen.Decisions;
+    private bool ShowingQueue => activeScreen is Screen.Queue or Screen.History or Screen.Decisions;
 
     private sealed record DocumentRow(int Number, QueueOutput? Output);
     private Guid? SelectedBatch => batchList.SelectedItems.Count == 1 && batchList.SelectedItems[0].Tag is Guid id ? id : null;
@@ -49,10 +53,13 @@ internal sealed partial class Workbench
         var view = new ListView
         {
             AccessibleName = name, View = View.Details, FullRowSelect = true, HideSelection = false,
-            MultiSelect = false, Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle,
+            MultiSelect = false, Dock = DockStyle.Fill, BorderStyle = BorderStyle.None,
             BackColor = Color.White, ForeColor = Ink
         };
         foreach (var (title, width) in columns) view.Columns.Add(title, width);
+        var fixedWidth = columns.Take(columns.Length - 1).Sum(column => column.Width);
+        view.ClientSizeChanged += (_, _) => view.Columns[^1].Width =
+            Math.Max(112, view.ClientSize.Width - fixedWidth - SystemInformation.VerticalScrollBarWidth);
         return view;
     }
 
@@ -62,32 +69,49 @@ internal sealed partial class Workbench
         reviewNext = Action("Review next", ReviewNext);
         openQueued = Action("Open PDF", OpenQueued);
         openDestination = Action("Open folder", OpenQueuedFolder);
-        retryDelivery = Action("Retry now", RetryQueued);
-        redirectDelivery = Action("Change destination…", RedirectQueued);
+        clearHistory = Action("Clear history", ClearHistory);
+        retryDelivery = BatchAction("Retry delivery", RetryQueued);
+        redirectDelivery = BatchAction("Change destination…", RedirectQueued);
         discardQueued = Action("Discard document…", DiscardQueued);
-        stopPreparation = Action("Stop processing", StopQueued);
-        removeBatch = Action("Remove batch…", RemoveQueuedBatch);
-        clearFinished = Action("Clear finished…", ClearFinishedBatches);
-        reprocess = Action("Reprocess originals", ReprocessOriginals);
-        var batchActions = Row();
-        batchActions.Controls.AddRange([stopPreparation, retryDelivery, redirectDelivery, reprocess, removeBatch, clearFinished]);
-        var buttons = Row();
-        buttons.Controls.AddRange([reviewQueued, reviewNext, openQueued, openDestination, discardQueued]);
-        var body = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Margin = Padding.Empty };
-        body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        body.RowStyles.Add(new RowStyle(SizeType.Percent, 47));
-        body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        body.RowStyles.Add(new RowStyle(SizeType.Percent, 53));
-        body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        body.Controls.Add(batchList);
-        body.Controls.Add(batchActions);
-        body.Controls.Add(Caption("Documents in selected batch"));
-        body.Controls.Add(documentList);
-        body.Controls.Add(buttons);
-        batchDetails.MaximumSize = new Size(955, 68);
-        body.Controls.Add(batchDetails);
+        stopPreparation = BatchAction("Stop processing", StopQueued);
+        removeBatch = BatchAction("Remove batch…", RemoveQueuedBatch);
+        clearFinished = BatchAction("Delete finished batch records…", ClearFinishedBatches);
+        reprocess = BatchAction("Reprocess originals", ReprocessOriginals);
+        var menu = new ContextMenuStrip();
+        menu.Items.AddRange([stopPreparation, retryDelivery, redirectDelivery, reprocess, new ToolStripSeparator(),
+            removeBatch, clearFinished]);
+        Disposed += (_, _) => menu.Dispose();
+        batchMenuButton = Action("Batch actions…", () =>
+        {
+            menu.Show(batchMenuButton, new Point(0, batchMenuButton.Height));
+            return Task.CompletedTask;
+        });
+        var commands = Row();
+        commands.Controls.AddRange([reviewQueued, reviewNext, openQueued, openDestination, discardQueued, batchMenuButton, clearHistory]);
+
+        var lists = SideBySide(39);
+        lists.AutoSize = false;
+        var batches = Card("Batches");
+        batches.AutoSize = false;
+        AddRow(batches, ListSurface(batchList, emptyBatches), fill: true);
+        var documents = Card("Documents");
+        documents.AutoSize = false;
+        documents.Margin = Padding.Empty;
+        AddRow(documents, ListSurface(documentList, emptyDocuments), fill: true);
+        lists.Controls.Add(batches, 0, 0);
+        lists.Controls.Add(documents, 1, 0);
+
+        var body = Column();
+        body.AutoSize = false;
+        AddRow(body, commands);
+        AddRow(body, lists, fill: true);
+        batchDetails.AutoSize = false;
+        batchDetails.AutoEllipsis = true;
+        batchDetails.Dock = DockStyle.Fill;
+        batchDetails.Height = 34;
+        batchDetails.TextAlign = ContentAlignment.MiddleLeft;
+        batchDetails.ForeColor = Muted;
+        AddRow(body, batchDetails);
         batchList.SelectedIndexChanged += (_, _) =>
         {
             if (!updatingQueue) RefreshDocuments();
@@ -102,6 +126,28 @@ internal sealed partial class Workbench
             else if (reviewQueued.Enabled) await ReviewQueued();
         };
         return body;
+    }
+
+    private static Label EmptyList() => new()
+    {
+        Dock = DockStyle.Fill, BackColor = Color.White, ForeColor = Muted,
+        TextAlign = ContentAlignment.MiddleCenter
+    };
+
+    private static Panel ListSurface(ListView list, Label empty)
+    {
+        var surface = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty };
+        surface.Controls.Add(list);
+        surface.Controls.Add(empty);
+        empty.BringToFront();
+        return surface;
+    }
+
+    private static ToolStripMenuItem BatchAction(string title, Func<Task> action)
+    {
+        var item = new ToolStripMenuItem(title);
+        item.Click += async (_, _) => await action();
+        return item;
     }
 
     private void StartQueue()
@@ -121,11 +167,15 @@ internal sealed partial class Workbench
     private void PumpQueue()
     {
         if (queueLifetime.IsCancellationRequested) return;
+        if (filingQueue.RetryPreparationSaves()) RefreshQueue();
         filingQueue.PruneExpiredOriginals(reprocessing);
         if (preparing is null && filingQueue.NextPreparation() is { } pending)
             _ = PrepareQueued(pending.Id);
-        if (transferring is null && filingQueue.NextTransfer() is { } ready && ready.Id != choosingNewDestination)
+        while (transferring.Count < 2 && filingQueue.NextTransfer(transferring, choosingNewDestination) is { } ready)
+        {
             _ = TransferQueued(ready.Id);
+            if (!transferring.Contains(ready.Id)) break;
+        }
     }
 
     private async Task PrepareQueued(Guid id)
@@ -212,7 +262,7 @@ internal sealed partial class Workbench
 
     private async Task TransferQueued(Guid id)
     {
-        transferring = id;
+        transferring.Add(id);
         var advanced = false;
         try
         {
@@ -227,11 +277,11 @@ internal sealed partial class Workbench
         }
         finally
         {
-            transferring = null;
+            transferring.Remove(id);
             if (!IsDisposed)
             {
                 RefreshQueue();
-                if (advanced) PumpQueue();
+                if (advanced) BeginInvoke(PumpQueue);
             }
         }
     }
@@ -241,19 +291,21 @@ internal sealed partial class Workbench
         var device = await SelectScanner();
         var duplex = sides.SelectedIndex == 0;
         var dpi = ScanDpi;
+        var paper = SelectedPaper;
+        var bitDepth = SelectedBitDepth;
         var token = operation!.Token;
         token.ThrowIfCancellationRequested();
-        var batch = filingQueue.Begin(saveFolder, duplex, GetProcessingOptions(), GetQuickChoices(), workers.SelectedIndex + 1);
+        var batch = filingQueue.Begin(saveFolder, duplex, GetScanProcessingOptions(), GetQuickChoices(), workers.SelectedIndex + 1);
         var early = preparing is null && filingQueue.NextPreparation() is null ? Channel.CreateUnbounded<int>(
             new UnboundedChannelOptions { SingleWriter = true }) : null;
         if (early is not null) _ = PrepareCapturedSheets(batch, early.Reader);
         RefreshQueue();
         var count = 0;
         string? failure = null;
-        status.Text = "Capturing pages for the local queue…";
+        status.Text = $"Capturing {paper.Name} pages for the local queue…";
         try
         {
-            await foreach (var page in engine.Scan(device, duplex ? PaperSource.Duplex : PaperSource.Feeder, dpi, token))
+            await foreach (var page in CapturePages(device, duplex, dpi, paper, bitDepth, token))
             {
                 using (page)
                 {
@@ -275,6 +327,10 @@ internal sealed partial class Workbench
         {
             failure = "Capture was canceled. Check that all pages are present.";
         }
+        catch (FeederStoppedException ex)
+        {
+            failure = ex.Message;
+        }
         catch (Exception ex)
         {
             failure = $"Capture stopped. Check that all pages are present. {ex.Message}";
@@ -285,7 +341,8 @@ internal sealed partial class Workbench
         failure = completed.ScanError;
         RefreshQueue(batch.Id);
         PumpQueue();
-        status.Text = completed.Pages == 0 ? failure ?? "The scanner returned no pages." :
+        status.Text = filingQueue.IsSavingPreparation(batch.Id) ? "The scanned pages are stored locally. Waiting to save the queue record." :
+            completed.Pages == 0 ? failure ?? "The scanner returned no pages." :
             failure is null ? $"Queued {completed.Pages} page(s). The feeder is ready for the next load." :
                 $"{completed.Pages} captured page(s) are available for review. {failure}";
     });
@@ -309,11 +366,17 @@ internal sealed partial class Workbench
         try
         {
             batchList.Items.Clear();
-            foreach (var batch in items.Where(batch => activeScreen == Screen.History || batch.NeedsReview))
+            var visible = activeScreen switch
+            {
+                Screen.Decisions => items.Where(batch => batch.NeedsReview),
+                Screen.Queue => items.Where(batch => !batch.IsFinished),
+                _ => filingQueue.History
+            };
+            foreach (var batch in visible)
             {
                 var state = BatchStatus(batch);
-                var row = new ListViewItem([batch.Created.LocalDateTime.ToString("dd MMM · HH:mm:ss"),
-                    batch.Pages == 0 ? "—" : batch.Pages.ToString(), state, batch.FiledCount.ToString(), batch.Destination])
+                var row = new ListViewItem([batch.Created.LocalDateTime.ToString("dd MMM HH:mm"),
+                    batch.Pages == 0 ? "—" : batch.Pages.ToString(), state])
                 {
                     Tag = batch.Id,
                     ForeColor = batch.NeedsReview ? Color.FromArgb(143, 80, 24) : Ink
@@ -329,11 +392,19 @@ internal sealed partial class Workbench
             batchList.EndUpdate();
             updatingQueue = false;
         }
+        emptyBatches.Visible = batchList.Items.Count == 0;
+        emptyBatches.Text = activeScreen switch
+        {
+            Screen.Decisions => "No scans need a decision.",
+            Screen.Queue => "No pending batches.",
+            _ => "No scans in history."
+        };
         RefreshDocuments();
     }
 
     private string BatchStatus(QueueBatch batch) => batch.Phase switch
     {
+        _ when filingQueue.IsSavingPreparation(batch.Id) => "Waiting to save queue",
         BatchPhase.Capturing when preparing?.Id == batch.Id && preparedPages > 0 => $"Scanning · {preparedPages} ready",
         BatchPhase.Capturing => "Scanning",
         BatchPhase.Queued when preparing?.Id == batch.Id && preparing?.Stop.IsCancellationRequested == false
@@ -343,12 +414,13 @@ internal sealed partial class Workbench
         BatchPhase.Processing => preparationStage == "Building PDFs" ? preparationStage : $"Recognizing {preparedPages}/{batch.Pages}",
         BatchPhase.Paused => "Paused",
         BatchPhase.Empty => "No pages",
-        _ when transferring == batch.Id => "Filing",
+        _ when transferring.Contains(batch.Id) => "Filing",
         _ when batch.NeedsReview && batch.TransferError is not null => "Review + waiting",
         _ when batch.NeedsReview => "Needs a decision",
         _ when batch.TransferError is not null => "Waiting for folder",
         _ when batch.HasPending => "Ready to file",
         _ when batch.FiledCount > 0 => "Filed",
+        _ when batch.Documents.Any(doc => doc.Disposition == QueueDisposition.SkippedBlank) => "Empty pages skipped",
         _ => "Closed"
     };
 
@@ -377,8 +449,8 @@ internal sealed partial class Workbench
                 batchDetails.Text = preparing?.Id == id && batch.Phase != BatchPhase.Paused ? PreparationDetails(batch) :
                     batch.Phase == BatchPhase.Paused ? "Original pages are kept locally. Resume processing or remove this batch." :
                     batch.TransferError ?? batch.ScanError ??
-                    (omitted == 0 ? batch.Destination : $"{batch.Destination} · {omitted} blank or show-through side(s) omitted");
-                foreach (var doc in batch.Documents.Where(doc => activeScreen == Screen.History ||
+                    (omitted == 0 ? batch.Destination : $"{batch.Destination} · {omitted} empty or show-through page(s) skipped");
+                foreach (var doc in batch.Documents.Where(doc => activeScreen != Screen.Decisions ||
                     doc.Disposition == QueueDisposition.Review))
                 {
                     var range = doc.FirstPage == doc.LastPage ? doc.FirstPage.ToString() : $"{doc.FirstPage}–{doc.LastPage}";
@@ -388,7 +460,7 @@ internal sealed partial class Workbench
                         {
                             var outcome = file.FiledPath is not null ? "Filed" :
                                 batch.TransferError is not null ? "Waiting for folder" :
-                                transferring == id ? "Filing" : "Ready";
+                                transferring.Contains(id) ? "Filing" : "Ready";
                             var details = doc.WeakOcrPages == 0 ? file.Name :
                                 $"Weak OCR on {doc.WeakOcrPages} page(s) · {file.Name}";
                             AddDocumentRow(doc.Number, range, outcome, details, file, previous);
@@ -396,20 +468,29 @@ internal sealed partial class Workbench
                     }
                     else
                     {
-                        var disposition = doc.Disposition == QueueDisposition.Review ? "Needs a decision" : "Discarded";
+                        var disposition = doc.Disposition switch
+                        {
+                            QueueDisposition.Review => "Needs a decision",
+                            QueueDisposition.SkippedBlank => "Skipped",
+                            QueueDisposition.Ready => "Deleted",
+                            _ => "Discarded"
+                        };
                         AddDocumentRow(doc.Number, range, disposition, doc.Reason ?? "", null, previous);
                     }
                 }
                 if (documentList.SelectedItems.Count == 0 && documentList.Items.Count > 0)
                     documentList.Items[0].Selected = true;
             }
-            else batchDetails.Text = activeScreen == Screen.Decisions ? "No scans need a decision." : "No scans in history.";
+            else batchDetails.Text = "";
         }
         finally
         {
             documentList.EndUpdate();
             updatingQueue = false;
         }
+        emptyDocuments.Visible = documentList.Items.Count == 0;
+        emptyDocuments.Text = SelectedBatch is null ? "Select a batch to see its documents." : "No documents in this batch.";
+        batchDetails.Visible = SelectedBatch is not null;
         UpdateQueueActions();
     }
 
@@ -434,23 +515,30 @@ internal sealed partial class Workbench
         var cached = selected is not null && batch?.Documents.Any(doc => doc.Number == selected.Number &&
             doc.FromAutomaticPages && filingQueue.HasOriginals(batch, doc.FirstPage, doc.LastPage)) == true;
         reviewQueued.Enabled = !busy && (issue || cached || selected?.Output?.FiledPath is not null);
-        if (stopPreparation.Parent is { } batchActions)
-            batchActions.Visible = activeScreen != Screen.Decisions;
-        openQueued.Visible = openDestination.Visible = activeScreen != Screen.Decisions;
+        var inDecisions = activeScreen == Screen.Decisions;
+        clearHistory.Visible = activeScreen == Screen.History;
+        clearHistory.Enabled = !clearingHistory;
+        openQueued.Visible = openDestination.Visible = batchMenuButton.Visible = !inDecisions;
+        reviewNext.Visible = inDecisions;
         reviewNext.Enabled = !busy && filingQueue.Batches.Any(item => item.NeedsReview);
         discardQueued.Enabled = !busy && issue && reviewing != (batch!.Id, selected!.Number);
+        discardQueued.Visible = issue;
         openQueued.Enabled = !busy && selected?.Output?.FiledPath is not null;
         openDestination.Enabled = !busy && batch is not null;
-        var canDeliver = !busy && batch?.HasPending == true && transferring != batch.Id;
+        var canDeliver = !busy && batch?.HasPending == true && !transferring.Contains(batch.Id);
         var paused = batch?.Phase == BatchPhase.Paused;
-        retryDelivery.Text = paused ? "Resume processing" : "Retry delivery";
-        retryDelivery.Enabled = canDeliver || (!busy && paused);
-        redirectDelivery.Enabled = canDeliver;
+        var saving = batch is not null && filingQueue.IsSavingPreparation(batch.Id);
+        retryDelivery.Text = saving ? "Retry queue save" : paused ? "Resume processing" : "Retry delivery";
+        retryDelivery.Enabled = canDeliver || (!busy && (paused || saving));
+        redirectDelivery.Enabled = canDeliver || (!busy && batch is { Phase: BatchPhase.Planned, NeedsReview: true } &&
+            !transferring.Contains(batch.Id));
         stopPreparation.Enabled = !busy && preparing is { } active && active.Id == batch?.Id &&
             !active.Stop.IsCancellationRequested;
         removeBatch.Enabled = !busy && batch is not null && CanRemoveBatch(batch);
         clearFinished.Enabled = !busy && filingQueue.Batches.Any(batch => batch.IsFinished && CanRemoveBatch(batch));
         reprocess.Enabled = !busy && batch is not null && filingQueue.CanReprocess(batch);
+        batchMenuButton.Enabled = stopPreparation.Enabled || retryDelivery.Enabled || redirectDelivery.Enabled ||
+            removeBatch.Enabled || clearFinished.Enabled || reprocess.Enabled;
     }
 
     private Task ReviewNext()
@@ -483,7 +571,8 @@ internal sealed partial class Workbench
             status.Text = "Continue reviewing this document.";
             return;
         }
-        if (doc.FromAutomaticPages && filingQueue.HasOriginals(batch, doc.FirstPage, doc.LastPage))
+        if (doc.Disposition == QueueDisposition.Review ||
+            (doc.FromAutomaticPages && filingQueue.HasOriginals(batch, doc.FirstPage, doc.LastPage)))
         {
             if (!LeaveCurrentReview()) return;
             await OpenAutomaticReview(batch, doc);
@@ -494,16 +583,14 @@ internal sealed partial class Workbench
             if (!LeaveCurrentReview()) return;
             if (IsPdfPath(path) && await Task.Run(() => File.Exists(path)))
             {
-                StartQueueReview(batch, documentNumber: null, oneDocument: true);
+                StartQueueReview(batch, documentNumber: null, SingleDocument(batch.Filing));
                 try
                 {
                     await AddPages(engine.Import(path));
                 }
-                catch (IOException) when (pages.Count == 0 &&
-                    filingQueue.HasOriginals(batch, doc.FirstPage, doc.LastPage))
+                catch (IOException) when (pages.Count == 0)
                 {
-                    await OpenOriginals(batch, doc.FirstPage, doc.LastPage, oneDocument: true);
-                    status.Text = "The filed PDF is unavailable. Retained original sides are open. Use Save copy to export.";
+                    await RestoreFiledOutput(batch, doc, output);
                     return;
                 }
                 if (pages.Count == 0) throw new IOException("The filed PDF contains no reviewable pages.");
@@ -511,65 +598,82 @@ internal sealed partial class Workbench
                 await PrepareBatch();
                 status.Text = "Filed PDF opened. Use Save copy to export your edits.";
             }
-            else if (filingQueue.HasOriginals(batch, doc.FirstPage, doc.LastPage))
-            {
-                await OpenOriginals(batch, doc.FirstPage, doc.LastPage, oneDocument: true);
-                status.Text = "The filed PDF is unavailable. Retained original sides are open. Use Save copy to export.";
-            }
-            else
-                throw new IOException("The filed PDF and its local originals are unavailable. Use Open PDF or images if the file was moved.");
-            return;
+            else await RestoreFiledOutput(batch, doc, output);
         }
-        if (doc.Disposition != QueueDisposition.Review) return;
-        if (!LeaveCurrentReview()) return;
-        StartQueueReview(batch, doc.Number, !batch.Filing.DetectDocuments);
-        await AddPages(ReadReviewPages(id, doc.FirstPage, doc.LastPage, doc.ReviewOmissions));
-        dirty = false;
-        await PrepareBatch();
-        status.Text = doc.Reason ?? "Check these pages, then approve filing.";
     });
+
+    private async Task RestoreFiledOutput(QueueBatch batch, QueueDocument doc, QueueOutput output)
+    {
+        if (output.Source is { Pages.Length: > 0 } source && source.Pages.All(edit =>
+                filingQueue.HasOriginals(batch, edit.Source, edit.Source)))
+        {
+            StartQueueReview(batch, documentNumber: null, SingleDocument(batch.Filing));
+            ApplyReviewProcessing(source.Processing);
+            foreach (var edit in source.Pages)
+                await AddAutomaticPage(batch, edit.Source, useCache: true, edit: edit);
+            await PrepareBatch();
+        }
+        else if (output.Source is null && doc.Outputs is { Length: 1 } &&
+            !output.Name.Contains($" - {doc.Number:D2}-", StringComparison.Ordinal) &&
+            filingQueue.HasOriginals(batch, doc.FirstPage, doc.LastPage))
+            await OpenOriginals(batch, doc.FirstPage, doc.LastPage, SingleDocument(batch.Filing));
+        else
+            throw new IOException("The selected PDF and its exact source pages are unavailable. Reprocess originals opens the original batch.");
+        status.Text = "The filed PDF is unavailable. Retained original sides are open. Use Save copy to export.";
+    }
 
     private async Task OpenAutomaticReview(QueueBatch batch, QueueDocument doc)
     {
         var needsDecision = doc.Disposition == QueueDisposition.Review;
-        StartQueueReview(batch, needsDecision ? doc.Number : null, !needsDecision || !batch.Filing.DetectDocuments);
+        var choices = !needsDecision ? SingleDocument(batch.Filing) :
+            doc.FromAutomaticPages ? batch.Filing with { SheetsPerDocument = 0 } : batch.Filing;
+        StartQueueReview(batch, needsDecision ? doc.Number : null, choices);
         automaticReview = (batch.Id, doc);
-        var numbers = Enumerable.Range(doc.FirstPage, doc.LastPage - doc.FirstPage + 1)
-            .Except(doc.ReviewOmissions ?? []).ToArray();
-        var focus = doc.DecisionPage is { } decision && numbers.Contains(decision) ? decision : numbers[0];
-        await AddAutomaticPage(batch, focus, useCache: true);
-        UpdatePlan();
-        await RefreshPreview();
-        status.Text = doc.Reason ?? "Opened local scan. Use Save copy to export edits.";
-        foreach (var number in numbers.Where(number => number != focus))
-            await AddAutomaticPage(batch, number, useCache: true);
-        pages.Sort((left, right) => left.CaptureNumber.CompareTo(right.CaptureNumber));
-        current = Array.IndexOf(numbers, focus);
-        var focused = pages[current];
-        await PrepareBatch(refreshPreview: focused.Prepared is null);
+        if (doc.Draft is { } saved) ApplyReviewProcessing(saved.Processing);
+        var edits = doc.Draft?.Pages ?? Enumerable.Range(doc.FirstPage, doc.LastPage - doc.FirstPage + 1)
+            .Except(doc.ReviewOmissions ?? []).Select(number => new PageEdit(number)).ToArray();
+        foreach (var edit in edits)
+            await AddAutomaticPage(batch, edit.Source, useCache: true, edit: edit);
+        current = Math.Max(0, Array.FindIndex(edits, edit => edit.Source == doc.DecisionPage));
+        var boundary = current > 0 && doc.DecisionPage is not null &&
+            doc.Reason?.StartsWith("Small item", StringComparison.Ordinal) != true &&
+            doc.Reason?.StartsWith("Possible writing", StringComparison.Ordinal) != true;
+        if (boundary) previewMode.SelectedIndex = BoundaryView;
+        await PrepareBatch();
         status.Text = doc.Reason ?? "Opened local scan. Use Save copy to export edits.";
     }
 
-    private async Task AddAutomaticPage(QueueBatch batch, int number, bool useCache)
+    private async Task AddAutomaticPage(QueueBatch batch, int number, bool useCache, bool restore = false, PageEdit? edit = null)
     {
         var token = operation!.Token;
         token.ThrowIfCancellationRequested();
-        var cached = useCache ? filingQueue.ReadPrepared(batch.Id, number, allowOlder: true) : null;
-        var side = !batch.Duplex ? SheetSide.Unpaired :
-            number % 2 == 0 && filingQueue.ReadPrepared(batch.Id, number - 1, allowOlder: true)?.OmitSide != true
-                ? SheetSide.Back : SheetSide.Front;
-        await foreach (var image in ReadReviewPages(batch.Id, number, number))
+        var cached = useCache ? filingQueue.ReadPrepared(batch.Id, number) : null;
+        var prepared = edit is { Rotation: not null } or { Crop: true } ? null : cached;
+        var layout = filingQueue.PageLayout(batch, number);
+        await foreach (var image in engine.Import(filingQueue.Original(batch.Id, number)))
         {
-            pages.Add(new Page(image, side, batch.Duplex ? (number + 1) / 2 : number)
+            pages.Add(new Page(image, layout.Side, layout.Sheet)
             {
                 CaptureNumber = number,
-                Prepared = cached is { OmitSide: false } ? cached : null,
-                Options = cached is { OmitSide: false } ? batch.Processing : null
+                KeepBlank = restore || edit?.KeepBlank == true,
+                Exclude = edit?.Exclude == true,
+                BreakBefore = edit?.BreakBefore,
+                Rotation = edit?.Rotation,
+                Crop = edit?.Crop == true,
+                Prepared = prepared,
+                Options = prepared is not null ? batch.Processing : null,
+                Evidence = cached switch
+                {
+                    null => null,
+                    { ReviewSide: true } => ReverseEvidence.Ambiguous,
+                    { VerifiedBlank: true } => ReverseEvidence.Empty,
+                    { OmitSide: true } => ReverseEvidence.ShowThrough,
+                    _ => ReverseEvidence.Content
+                }
             });
-            break;
+            return;
         }
-        if (pages.All(page => page.CaptureNumber != number))
-            throw new IOException($"Original side {number} could not be opened.");
+        throw new IOException($"Original side {number} could not be opened.");
     }
 
     private int[] AvailableOmissions() => automaticReview is { } active
@@ -612,10 +716,13 @@ internal sealed partial class Workbench
             selected = omitted[choices.SelectedIndex];
         }
         finally { SetImage(image, null); }
-        await AddAutomaticPage(batch, selected, useCache: false);
-        pages.Sort((left, right) => left.CaptureNumber.CompareTo(right.CaptureNumber));
-        current = pages.FindIndex(page => page.CaptureNumber == selected);
-        dirty = true;
+        await AddAutomaticPage(batch, selected, useCache: false, restore: true);
+        var restored = pages[^1];
+        pages.RemoveAt(pages.Count - 1);
+        current = pages.FindIndex(page => page.CaptureNumber > selected);
+        if (current < 0) current = pages.Count;
+        pages.Insert(current, restored);
+        RememberReviewEdits();
         await PrepareBatch();
         status.Text = $"Restored original side {selected}. Save to include it.";
     });
@@ -626,42 +733,32 @@ internal sealed partial class Workbench
         var batch = filingQueue.Get(id);
         if (!filingQueue.CanReprocess(batch))
             throw new IOException("The local originals are no longer available.");
-        await OpenOriginals(batch, 1, batch.Pages, !batch.Filing.DetectDocuments);
+        await OpenOriginals(batch, 1, batch.Pages, GetQuickChoices());
         status.Text = "Original sides reopened. Use Save copy to choose a destination for the new PDF.";
     });
 
-    private async Task OpenOriginals(QueueBatch batch, int first, int last, bool oneDocument)
+    private async Task OpenOriginals(QueueBatch batch, int first, int last, QuickFilingOptions choices)
     {
-        StartQueueReview(batch, documentNumber: null, oneDocument);
-        await AddPages(ReadReviewPages(batch.Id, first, last), batch.Duplex && first % 2 == 1);
-        dirty = false;
+        StartQueueReview(batch, documentNumber: null, choices);
+        for (var number = first; number <= last; number++)
+            await AddAutomaticPage(batch, number, useCache: false);
         await PrepareBatch();
     }
 
-    private void StartQueueReview(QueueBatch batch, int? documentNumber, bool oneDocument)
+    private static QuickFilingOptions SingleDocument(QuickFilingOptions options) =>
+        options with { DetectDocuments = false, SheetsPerDocument = 0 };
+
+    private void StartQueueReview(QueueBatch batch, int? documentNumber, QuickFilingOptions choices)
     {
         DisposePages();
         if (documentNumber is { } number)
             reviewing = (batch.Id, number);
         else
             reprocessing = batch.Id;
-        oneDocumentBatch = oneDocument;
-        language.SelectedIndex = batch.Processing.Language switch { "eng" => 1, "deu+eng" => 2, _ => 0 };
-        straighten.Checked = batch.Processing.Straighten;
-        clean.Checked = batch.Processing.Clean;
-        autoOrient.Checked = batch.Processing.AutoOrient;
+        SetReviewGrouping(choices);
+        ApplyReviewProcessing(batch.Processing);
+        UpdatePlan();
         ShowScreen(Screen.Review);
-    }
-
-    private async IAsyncEnumerable<NAPS2.Images.ProcessedImage> ReadReviewPages(Guid id, int first, int last,
-        int[]? omitted = null)
-    {
-        for (var page = first; page <= last; page++)
-        {
-            if (omitted?.Contains(page) == true) continue;
-            await foreach (var image in engine.Import(filingQueue.Original(id, page)))
-                yield return image;
-        }
     }
 
     private bool LeaveCurrentReview()
@@ -677,12 +774,7 @@ internal sealed partial class Workbench
         if (reviewing is not { } current) return Task.CompletedTask;
         var batch = filingQueue.Get(current.Batch);
         var document = batch.Documents.Single(doc => doc.Number == current.Document);
-        var compareBoundary = this.current > 0 && document.DecisionPage == pages[this.current].CaptureNumber &&
-            document.DecisionPage is not null && document.Reason?.StartsWith("Small item", StringComparison.Ordinal) != true;
-        var pair = compareBoundary
-            ? new[] { (pages[this.current - 1].CaptureNumber, 0, "Previous page"),
-                (pages[this.current].CaptureNumber, 1, "Possible new document") }
-            : new[] { (document.FirstPage - 1, 0, "Previous page"), (document.LastPage + 1, 1, "Next page") };
+        var pair = new[] { (document.FirstPage - 1, 0, "Previous page"), (document.LastPage + 1, 1, "Next page") };
         using var dialog = new Form
         {
             Text = "Neighboring scanned pages", ClientSize = new Size(860, 615), StartPosition = FormStartPosition.CenterParent,
@@ -708,20 +800,7 @@ internal sealed partial class Workbench
                     { SizeMode = PictureBoxSizeMode.Zoom, Image = copy }), column, 0);
             }
             dialog.Controls.Add(layout);
-            if (compareBoundary)
-            {
-                var decisions = Row();
-                decisions.Dock = DockStyle.Bottom;
-                decisions.Controls.AddRange([
-                    new Button { Text = "Split here", AutoSize = true, DialogResult = DialogResult.Yes },
-                    new Button { Text = "Keep together", AutoSize = true, DialogResult = DialogResult.No },
-                    new Button { Text = "Cancel", AutoSize = true, DialogResult = DialogResult.Cancel }
-                ]);
-                dialog.Controls.Add(decisions);
-            }
-            var result = dialog.ShowDialog(this);
-            if (result is DialogResult.Yes or DialogResult.No)
-                SetBoundary(result == DialogResult.Yes);
+            dialog.ShowDialog(this);
         }
         finally
         {
@@ -754,9 +833,11 @@ internal sealed partial class Workbench
 
     private Task RetryQueued() => Run("Scheduling queue work…", () =>
     {
-        if (SelectedBatch is { } id && transferring != id)
+        if (SelectedBatch is { } id && !transferring.Contains(id))
         {
-            if (filingQueue.Get(id).Phase == BatchPhase.Paused)
+            if (filingQueue.IsSavingPreparation(id))
+                status.Text = filingQueue.RetryPreparationSaves(id) ? "Saved queue status." : "Waiting to save queue status.";
+            else if (filingQueue.Get(id).Phase == BatchPhase.Paused)
             {
                 filingQueue.Resume(id);
                 status.Text = "Processing scheduled.";
@@ -784,9 +865,63 @@ internal sealed partial class Workbench
     }
 
     private bool CanRemoveBatch(QueueBatch batch) =>
-        batch.Phase is not (BatchPhase.Capturing or BatchPhase.Processing) &&
-        preparing?.Id != batch.Id && transferring != batch.Id && choosingNewDestination != batch.Id && reviewing?.Batch != batch.Id &&
+        !clearingHistory && batch.Phase is not (BatchPhase.Capturing or BatchPhase.Processing) &&
+        preparing?.Id != batch.Id && !transferring.Contains(batch.Id) && choosingNewDestination != batch.Id && reviewing?.Batch != batch.Id &&
         reprocessing != batch.Id;
+
+    private async Task ClearHistory()
+    {
+        if (clearingHistory) return;
+        var history = filingQueue.History.ToArray();
+        if (history.Length == 0)
+        {
+            status.Text = "History is already clear.";
+            return;
+        }
+        var paths = history.SelectMany(batch => batch.Documents).SelectMany(doc => doc.Outputs ?? [])
+            .Select(file => file.FiledPath).OfType<string>().ToArray();
+        if (paths.Length > 0 && !ConfirmHistoryDeletion(paths)) return;
+
+        clearingHistory = true;
+        UpdateQueueActions();
+        status.Text = "Clearing history…";
+        try
+        {
+            var (failed, error) = await filingQueue.ClearHistory(history);
+            status.Text = failed > 0 ? $"Could not clear {failed} file(s) or records. {error}" :
+                filingQueue.History.Any() ? "Cleared the confirmed files. New scans are listed in History." :
+                "History cleared. Pending batches are in Queue.";
+        }
+        finally
+        {
+            clearingHistory = false;
+            RefreshQueue();
+        }
+    }
+
+    private bool ConfirmHistoryDeletion(string[] paths)
+    {
+        using var dialog = new Form
+        {
+            Text = "Clear history", ClientSize = new Size(760, 320), MinimumSize = new Size(510, 250),
+            StartPosition = FormStartPosition.CenterParent, Font = Font, ShowInTaskbar = false
+        };
+        var body = Column();
+        body.AutoSize = false;
+        body.Padding = new Padding(12);
+        AddRow(body, Caption($"Permanently delete {paths.Length} saved PDF(s) and clear History? Pending scans will continue."));
+        var files = new ListBox { Dock = DockStyle.Fill, HorizontalScrollbar = true, AccessibleName = "PDFs to delete" };
+        files.Items.AddRange(paths);
+        AddRow(body, files, fill: true);
+        var actions = Row();
+        var delete = new Button { Text = "Delete PDFs and clear", AutoSize = true, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", AutoSize = true, DialogResult = DialogResult.Cancel };
+        actions.Controls.AddRange([delete, cancel]);
+        AddRow(body, actions);
+        dialog.Controls.Add(body);
+        dialog.AcceptButton = dialog.CancelButton = cancel;
+        return dialog.ShowDialog(this) == DialogResult.OK;
+    }
 
     private Task RemoveQueuedBatch() => Run("Checking the selected batch…", () =>
     {
@@ -820,27 +955,27 @@ internal sealed partial class Workbench
         {
             RefreshQueue();
         }
-        status.Text = cleaned ? "Finished batches cleared." : "History cleared. Local file cleanup will retry when the app restarts.";
+        status.Text = cleaned ? "Finished batch records deleted." : "Finished batch records removed. Local file cleanup will retry when the app restarts.";
         return Task.CompletedTask;
     });
 
-    private Task RedirectQueued() => Run("Choosing a destination for pending PDFs…", async () =>
+    private Task RedirectQueued() => Run("Choosing a batch destination…", async () =>
     {
-        if (SelectedBatch is not { } id || transferring == id) return;
+        if (SelectedBatch is not { } id || transferring.Contains(id)) return;
         choosingNewDestination = id;
         try
         {
             var batch = filingQueue.Get(id);
             using var dialog = new FolderBrowserDialog
             {
-                Description = "Choose a folder for this batch’s pending PDFs", UseDescriptionForTitle = true,
+                Description = "Choose a folder for this batch’s PDFs", UseDescriptionForTitle = true,
                 InitialDirectory = await Task.Run(() => Directory.Exists(batch.Destination)
                     ? batch.Destination : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments))
             };
             if (dialog.ShowDialog(this) == DialogResult.OK)
             {
                 filingQueue.Redirect(id, dialog.SelectedPath);
-                status.Text = "Pending PDFs will be delivered to the new folder.";
+                status.Text = "Future PDFs will be delivered to the new folder.";
             }
             else status.Text = "Folder change canceled.";
         }

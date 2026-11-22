@@ -2,12 +2,15 @@ using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using NAPS2.Images;
 using NAPS2.Images.Gdi;
 using NAPS2.Images.Transforms;
 using NAPS2.ImportExport;
 using NAPS2.Scan;
+using NAPS2.Scan.Exceptions;
+using NAPS2.Wia;
 using PdfSharpCore.Pdf;
 using PdfSharpCore.Pdf.IO;
 
@@ -20,6 +23,7 @@ internal sealed class DocumentEngine : IDisposable
     private readonly ScanController scanner;
     private readonly FileStorageManager scratch;
     private readonly TimeSpan ocrBudget;
+    private readonly Dictionary<Driver, Task<List<ScanDevice>>> driverProbes = [];
 
     public DocumentEngine(TimeSpan? ocrBudget = null)
     {
@@ -38,41 +42,140 @@ internal sealed class DocumentEngine : IDisposable
     public async Task<List<ScanDevice>> Devices()
     {
         List<ScanDevice> devices = [];
-        try
-        {
-            devices.AddRange(await scanner.GetDeviceList(Driver.Wia));
-        }
-        catch (Exception ex)
-        {
-            Trace.TraceWarning("WIA scanner discovery failed. {0}", ex.Message);
-        }
-        try
-        {
-            devices.AddRange(await scanner.GetDeviceList(Driver.Twain));
-        }
-        catch (Exception ex) when (devices.Count > 0)
-        {
-            Trace.TraceWarning("TWAIN scanner discovery failed. {0}", ex.Message);
-        }
+        await foreach (var result in DiscoverDevices(CancellationToken.None))
+            if (result is not null) devices.AddRange(result);
         return devices;
+    }
+
+    public IAsyncEnumerable<List<ScanDevice>?> DiscoverDevices(CancellationToken token) =>
+        AwaitDriverProbes([Probe(Driver.Wia), Probe(Driver.Twain)], TimeSpan.FromSeconds(8), token);
+
+    private Task<List<ScanDevice>> Probe(Driver driver)
+    {
+        if (driverProbes.TryGetValue(driver, out var active) && !active.IsCompleted)
+            return active;
+        // A timed-out driver keeps its own context and cannot borrow the scanner used for capture.
+        return driverProbes[driver] = Task.Run(async () =>
+        {
+            try
+            {
+                using var discovery = new DocumentEngine();
+                return (await discovery.scanner.GetDeviceList(driver)).ToList();
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceWarning("{0} scanner discovery failed. {1}", driver, ex.Message);
+                return [];
+            }
+        });
+    }
+
+    internal static async IAsyncEnumerable<List<ScanDevice>?> AwaitDriverProbes(
+        IEnumerable<Task<List<ScanDevice>>> probes, TimeSpan timeout,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken token)
+    {
+        var pending = probes.ToList();
+        var deadline = Task.Delay(timeout);
+        while (pending.Count > 0)
+        {
+            var completed = await Task.WhenAny(pending.Cast<Task>().Append(deadline)).WaitAsync(token);
+            token.ThrowIfCancellationRequested();
+            if (completed == deadline)
+            {
+                yield return null;
+                yield break;
+            }
+            var probe = (Task<List<ScanDevice>>)completed;
+            pending.Remove(probe);
+            yield return await probe;
+        }
     }
 
     public static bool IsCanonWia(ScanDevice device) =>
         device.Driver == Driver.Wia &&
         device.Name.Equals("CANON DR-C225 USB", StringComparison.OrdinalIgnoreCase);
 
-    public IAsyncEnumerable<ProcessedImage> Scan(ScanDevice device, PaperSource source, int dpi,
-        CancellationToken token) =>
-        scanner.Scan(new ScanOptions
+    public IAsyncEnumerable<ProcessedImage> Scan(ScanDevice device, PaperSource source, int dpi, ScanPaper paper, BitDepth bitDepth,
+        CancellationToken token, IntPtr twainDialogParent = default) =>
+        scanner.Scan(CreateScanOptions(device, source, dpi, paper, bitDepth, twainDialogParent), token);
+
+    internal static ScanOptions CreateScanOptions(ScanDevice device, PaperSource source, int dpi, ScanPaper paper,
+        BitDepth bitDepth, IntPtr twainDialogParent = default) =>
+        new()
         {
             Device = device,
             PaperSource = source,
-            PageSize = PageSize.A4,
+            PageSize = paper.Size,
+            // The DR-C225 feeds narrow sheets between its centered guides.
+            PageAlign = source != PaperSource.Flatbed && paper.Size.WidthInMm < PageSize.A4.WidthInMm &&
+                device.Name.Contains("DR-C225", StringComparison.OrdinalIgnoreCase)
+                ? HorizontalAlign.Center : HorizontalAlign.Right,
             Dpi = dpi,
-            BitDepth = BitDepth.Color,
+            BitDepth = bitDepth,
+            UseNativeUI = device.Driver == Driver.Twain && twainDialogParent != IntPtr.Zero,
+            DialogParent = device.Driver == Driver.Twain ? twainDialogParent : IntPtr.Zero,
             MaxQuality = true,
             ExcludeBlankPages = false
-        }, token);
+        };
+
+    internal static async IAsyncEnumerable<ProcessedImage> CaptureWithFeederRecovery(
+        Func<IAsyncEnumerable<ProcessedImage>> capture, bool duplex, Func<string, int, bool> reload,
+        [EnumeratorCancellation] CancellationToken token)
+    {
+        var sidesPerSheet = duplex ? 2 : 1;
+        var received = 0;
+        var retrying = false;
+        while (true)
+        {
+            token.ThrowIfCancellationRequested();
+            Exception? fault = null;
+            string? problem = null;
+            var before = received;
+            await using (var scan = capture().GetAsyncEnumerator(token))
+            {
+                while (true)
+                {
+                    bool next;
+                    try { next = await scan.MoveNextAsync(); }
+                    catch (Exception ex) when ((problem = FeederProblem(ex, retrying)) is not null)
+                    {
+                        fault = ex;
+                        break;
+                    }
+                    if (!next) break;
+                    received++;
+                    yield return scan.Current;
+                }
+            }
+            token.ThrowIfCancellationRequested();
+            if (problem is null)
+            {
+                if (!retrying || received > before) yield break;
+                throw new FeederStoppedException("No replacement sheets were captured. Check the pages before filing.");
+            }
+            if (received % sidesPerSheet != 0)
+                throw new FeederStoppedException($"{problem} Only one side of the last sheet was captured. Check that sheet in review.", fault);
+            if (!reload(problem, received / sidesPerSheet))
+                throw new FeederStoppedException($"{problem} Capture stopped. Check that all pages are present.", fault);
+            retrying = true;
+        }
+    }
+
+    private static string? FeederProblem(Exception error, bool retrying)
+    {
+        const uint wiaMultiFeed = 0x80210020;
+        for (Exception? cause = error; cause is not null; cause = cause.InnerException)
+        {
+            if (unchecked((uint)cause.HResult) == wiaMultiFeed || cause is WiaException { ErrorCode: wiaMultiFeed } ||
+                cause is DeviceException { Message: "TWAIN error: PaperDoubleFeed" })
+                return "The scanner detected two sheets feeding together.";
+            if (cause is DevicePaperJamException)
+                return "The scanner reported a paper jam or feed error.";
+            if (retrying && cause is DeviceFeederEmptyException)
+                return "The scanner did not detect any sheets in the feeder.";
+        }
+        return null;
+    }
 
     public IAsyncEnumerable<ProcessedImage> Import(string path) =>
         new FileImporter(context).Import(path);
@@ -113,24 +216,25 @@ internal sealed class DocumentEngine : IDisposable
     }
 
     public async Task<PreparedPage> Prepare(ProcessedImage original, int? rotation, ProcessingOptions options,
-        CancellationToken token, bool crop = false)
+        CancellationToken token, bool crop = false, bool? verifiedBlank = null)
     {
         var stem = Path.Combine(scratch.FolderPath, Guid.NewGuid().ToString("N"));
         PreparedPage? page = null;
         try
         {
+            token.ThrowIfCancellationRequested();
+            if (verifiedBlank is null)
+            {
+                using var raw = Preview(original);
+                verifiedBlank = ScanImageEvidence.IsEmptyPage(raw);
+            }
+
             ScanInput Render(int angle, string suffix)
             {
                 token.ThrowIfCancellationRequested();
                 var imagePath = stem + suffix + ".png";
                 using var corrected = Correct(original, angle, options.Straighten, options.Clean, out var paper);
                 var dpi = Math.Clamp((int)Math.Round(corrected.HorizontalResolution), 70, 9600);
-                var blank = false;
-                if (paper.LooksBlank)
-                {
-                    using var raw = Preview(original);
-                    blank = PaperCorrection.IsUniformPale(raw);
-                }
                 var bounds = crop ? ScanImageEvidence.SuggestCrop(corrected, out _) : Rectangle.Empty;
                 if (bounds.IsEmpty)
                     corrected.Save(imagePath, ImageFormat.Png);
@@ -140,12 +244,12 @@ internal sealed class DocumentEngine : IDisposable
                     cropped.SetResolution(dpi, dpi);
                     cropped.Save(imagePath, ImageFormat.Png);
                 }
-                return new ScanInput(imagePath, dpi, angle, paper.IsPaper, blank, paper.LooksBlank,
+                return new ScanInput(imagePath, dpi, angle, paper.IsPaper, paper.LooksBlank,
                     paper.HasDenseGraphics, paper.FaintText, paper.PdfQuality);
             }
 
             var input = Render(rotation ?? 0, "-original");
-            if (input.Blank)
+            if (verifiedBlank == true)
             {
                 var blankPdf = stem + "-blank.pdf";
                 ScanPdf.WriteImageOnly(input.Path, blankPdf, input.Dpi, input.PdfQuality);
@@ -261,7 +365,8 @@ internal sealed class DocumentEngine : IDisposable
                 }
                 page = new PreparedPage(input.Path, pdf, PageClues.FromText(best.Text, input.LooksBlank),
                     best.Text, best.Quality, input.Angle, input.IsPaper,
-                    CropSuggested: cropSuggested, ReviewCrop: reviewCrop, PdfImageReady: true);
+                    CropSuggested: cropSuggested, ReviewCrop: reviewCrop, PdfImageReady: true,
+                    WeakWords: best.WeakWords);
             }
             return page;
         }
@@ -273,9 +378,9 @@ internal sealed class DocumentEngine : IDisposable
         }
     }
 
-    private sealed record ScanInput(string Path, int Dpi, int Angle, bool IsPaper, bool Blank, bool LooksBlank,
+    private sealed record ScanInput(string Path, int Dpi, int Angle, bool IsPaper, bool LooksBlank,
         bool DenseGraphics, bool FaintText, long PdfQuality);
-    private sealed record OcrPass(string Pdf, string Text, OcrQuality Quality);
+    private sealed record OcrPass(string Pdf, string Text, OcrQuality Quality, OcrWordRegion[] WeakWords);
     private sealed class OcrFailure(string message) : IOException(message);
 
     private static async Task<int?> ProbeBlockRotation(ScanInput input, string stem, string language,
@@ -347,8 +452,8 @@ internal sealed class DocumentEngine : IDisposable
         {
             throw new OcrFailure("Tesseract did not produce a complete searchable page.");
         }
-        return new OcrPass(pdf, await File.ReadAllTextAsync(text, token),
-            OcrQuality.FromTsv(await File.ReadAllTextAsync(tsv, token)));
+        var quality = OcrQuality.FromTsv(await File.ReadAllTextAsync(tsv, token), out var weakWords);
+        return new OcrPass(pdf, await File.ReadAllTextAsync(text, token), quality, weakWords);
     }
 
     private static async Task<(int ExitCode, string Output, string Error)> RunTesseract(ScanInput input,
@@ -429,14 +534,21 @@ internal sealed class DocumentEngine : IDisposable
     }
 }
 
+internal sealed class FeederStoppedException(string message, Exception? cause = null) : Exception(message, cause);
+
 internal sealed record ProcessingOptions(bool Straighten, bool Clean, string Language, bool AutoOrient = true);
 
 internal sealed record PreparedPage(string Image, string Pdf, PageClues Clues,
     string Text, OcrQuality Quality, int Orientation, bool IsPaper, bool OcrUnavailable = false,
     bool VerifiedBlank = false, bool OmitSide = false, bool CropSuggested = false, bool ReviewCrop = false,
-    bool OwnsFiles = true, bool PdfImageReady = false) : IDisposable
+    bool OwnsFiles = true, bool PdfImageReady = false, OcrWordRegion[]? WeakWords = null,
+    bool ReviewSide = false) : IDisposable
 {
+    public static PreparedPage Omitted(ReverseEvidence evidence) => new("", "", PageClues.FromText("", true),
+        "", default, 0, true, VerifiedBlank: evidence == ReverseEvidence.Empty, OmitSide: true);
+
     public bool NeedsReview => OcrUnavailable || (IsPaper && !Clues.Blank && Quality.NeedsReview);
+    public bool TrustsPageNumber => !OcrUnavailable && Quality.Confidence >= 80;
     public void Dispose()
     {
         if (!OwnsFiles) return;

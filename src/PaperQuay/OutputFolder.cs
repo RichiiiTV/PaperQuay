@@ -9,8 +9,10 @@ internal static class OutputFolder
         "PaperQuay");
     private static readonly string Preference = Path.Combine(PreferenceFolder, "save-folder.txt");
     private static readonly string QuickPreference = Path.Combine(PreferenceFolder, "quick-filing.json");
+    private static readonly string ProfilesPreference = Path.Combine(PreferenceFolder, "scan-profiles.json");
 
-    public static string? Load(bool mixed = false) => ReadFolder(ProfilePreference(mixed)) ?? ReadFolder(Preference);
+    public static string? Load(bool mixed = false) => ReadFolder(ProfilePreference(mixed)) ?? ReadFolder(Preference)
+        ?? (mixed ? ReadFolder(ProfilePreference(false)) : null);
 
     private static string? ReadFolder(string preference)
     {
@@ -30,17 +32,40 @@ internal static class OutputFolder
 
     public static QuickFilingOptions LoadQuick()
     {
+        var defaults = new QuickFilingOptions(DetectDocuments: true);
         try
         {
-            return JsonSerializer.Deserialize<QuickFilingOptions>(File.ReadAllText(QuickPreference)) ?? new();
+            return JsonSerializer.Deserialize<QuickFilingOptions>(File.ReadAllText(QuickPreference)) ?? defaults;
         }
-        catch (IOException) { return new(); }
-        catch (UnauthorizedAccessException) { return new(); }
-        catch (JsonException) { return new(); }
+        catch (IOException) { return defaults; }
+        catch (UnauthorizedAccessException) { return defaults; }
+        catch (JsonException) { return defaults; }
     }
 
     public static void SaveQuick(QuickFilingOptions settings) =>
         WritePreference(QuickPreference, JsonSerializer.Serialize(settings));
+
+    public static ScanProfile[] LoadProfiles()
+    {
+        try { return ParseProfiles(File.ReadAllText(ProfilesPreference)); }
+        catch (IOException) { return []; }
+        catch (UnauthorizedAccessException) { return []; }
+    }
+
+    internal static ScanProfile[] ParseProfiles(string json)
+    {
+        try
+        {
+            return (JsonSerializer.Deserialize<ScanProfile[]>(json) ?? [])
+                .Where(profile => profile is { Name.Length: > 0, Folder.Length: > 0, Filing: not null,
+                    Processing: not null } && Path.IsPathFullyQualified(profile.Folder))
+                .DistinctBy(profile => profile.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+        }
+        catch (JsonException) { return []; }
+    }
+
+    public static void SaveProfiles(IEnumerable<ScanProfile> profiles) =>
+        WritePreference(ProfilesPreference, JsonSerializer.Serialize(profiles));
 
     private static void WritePreference(string path, string value)
     {
@@ -54,46 +79,6 @@ internal static class OutputFolder
         finally
         {
             File.Delete(temporary);
-        }
-    }
-
-    public static void Export(string folder, PreparedPage[][] documents, CancellationToken token)
-    {
-        var prefix = $"Scan {DateTime.Now:yyyy-MM-dd HHmmss-fff}";
-        var session = Guid.NewGuid().ToString("N");
-        var staged = new List<(string Temporary, string Final)>();
-        var published = 0;
-        try
-        {
-            for (int i = 0; i < documents.Length; i++)
-            {
-                token.ThrowIfCancellationRequested();
-                var temporary = Path.Combine(folder, $".scan-{session}-{i + 1:D2}.tmp");
-                var final = Path.Combine(folder, $"{prefix} - {i + 1:D2}.pdf");
-                staged.Add((temporary, final));
-                DocumentEngine.Merge(temporary, documents[i], token);
-            }
-            token.ThrowIfCancellationRequested();
-            foreach (var (temporary, final) in staged)
-            {
-                File.Move(temporary, final);
-                published++;
-            }
-        }
-        catch (Exception ex) when (published > 0)
-        {
-            throw new IOException($"Saved {published} of {documents.Length} PDFs with prefix {prefix}. " +
-                $"The remaining PDFs could not be published. {ex.Message}", ex);
-        }
-        finally
-        {
-            for (var i = published; i < staged.Count; i++)
-            {
-                // The destination may be offline; keep the original error and leave partial files as .tmp.
-                try { File.Delete(staged[i].Temporary); }
-                catch (IOException) { }
-                catch (UnauthorizedAccessException) { }
-            }
         }
     }
 }

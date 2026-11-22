@@ -6,6 +6,7 @@ namespace PaperQuay;
 internal sealed partial class FilingQueue
 {
     private const string CachePrefix = "prepared-v";
+    private const int CacheVersion = 10;
     private sealed record CachedPage(PreparedPage Page, long ImageBytes, long PdfBytes);
 
     public async Task PrepareDuringCapture(QueueBatch batch, IAsyncEnumerable<int> sheets,
@@ -32,19 +33,13 @@ internal sealed partial class FilingQueue
     {
         var count = batch.Duplex ? 2 : 1;
         var cached = Enumerable.Range(first, count).Select(number => ReadPrepared(batch.Id, number)).ToArray();
-        var omission = 0;
-        var blank = false;
-        if (batch.Duplex && batch.Filing.SkipBlankBacks && cached.Any(page => page is null))
+        ReverseEvidence[] evidence = [];
+        if (cached.Any(page => page is null))
         {
             token.ThrowIfCancellationRequested();
             using var front = new Bitmap(Original(batch.Id, first));
-            using var back = new Bitmap(Original(batch.Id, first + 1));
-            var blankBack = PaperCorrection.IsUniformPale(back);
-            var blankFront = !blankBack && PaperCorrection.IsUniformPale(front);
-            blank = blankBack || blankFront;
-            omission = blankBack ? first + 1 : blankFront ? first :
-                ScanImageEvidence.IsShowThrough(front, back) ? first + 1 :
-                ScanImageEvidence.IsShowThrough(back, front) ? first : 0;
+            using var back = batch.Duplex ? new Bitmap(Original(batch.Id, first + 1)) : null;
+            evidence = ScanImageEvidence.CheckSheet(front, back, batch.Filing);
         }
         async Task PrepareSide(int offset)
         {
@@ -53,16 +48,18 @@ internal sealed partial class FilingQueue
             var page = cached[offset];
             if (page is null)
             {
-                if (number == omission)
-                    page = new PreparedPage("", "", PageClues.FromText("", true), "", default, 0, true,
-                        VerifiedBlank: blank, OmitSide: true);
+                var side = evidence[offset];
+                var blank = side == ReverseEvidence.Empty;
+                if (batch.Filing.Omits(side))
+                    page = PreparedPage.Omitted(side);
                 else
                 {
                     await slots.WaitAsync(token);
-                    try { page = await PrepareOriginal(engine, batch, number, token); }
+                    try { page = await PrepareOriginal(engine, batch, number, token, blank); }
                     finally { slots.Release(); }
+                    if (side == ReverseEvidence.Ambiguous) page = page with { ReviewSide = true };
                 }
-                TryCache(batch.Id, number, page);
+                CachePrepared(batch.Id, number, page);
             }
             accept(number, page);
         }
@@ -71,24 +68,22 @@ internal sealed partial class FilingQueue
     }
 
     private async Task<PreparedPage> PrepareOriginal(DocumentEngine engine, QueueBatch batch, int page,
-        CancellationToken token)
+        CancellationToken token, bool? verifiedBlank)
     {
         await foreach (var image in engine.Import(Original(batch.Id, page)))
         {
             using (image)
-                return await engine.Prepare(image, null, batch.Processing, token);
+                return await engine.Prepare(image, null, batch.Processing, token, verifiedBlank: verifiedBlank);
         }
         throw new InvalidDataException($"Queued page {page} could not be read.");
     }
 
-    private string PreparedPath(Guid id, int number, int version) =>
-        Path.Combine(Folder(id), $"{CachePrefix}{version}-{number:D6}");
+    private string PreparedPath(Guid id, int number) =>
+        Path.Combine(Folder(id), $"{CachePrefix}{CacheVersion}-{number:D6}");
 
-    public PreparedPage? ReadPrepared(Guid id, int number, bool allowOlder = false)
+    public PreparedPage? ReadPrepared(Guid id, int number)
     {
-        var path = PreparedPath(id, number, 2);
-        if (allowOlder && !File.Exists(path + ".json"))
-            path = PreparedPath(id, number, 1);
+        var path = PreparedPath(id, number);
         if (!File.Exists(path + ".json")) return null;
         try
         {
@@ -106,9 +101,9 @@ internal sealed partial class FilingQueue
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return null; }
     }
 
-    private void TryCache(Guid id, int number, PreparedPage page)
+    public void CachePrepared(Guid id, int number, PreparedPage page)
     {
-        var path = PreparedPath(id, number, 2);
+        var path = PreparedPath(id, number);
         var pending = path + ".tmp";
         try
         {

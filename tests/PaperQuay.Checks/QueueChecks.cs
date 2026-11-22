@@ -6,6 +6,18 @@ internal static class QueueChecks
 {
     private static readonly ProcessingOptions Settings = new(true, true, "deu");
 
+    public static async Task ExportFixture(string folder, PreparedPage[][] documents)
+    {
+        using var queue = new FilingQueue(Path.Combine(folder, "queue"));
+        var draft = queue.Begin(folder, false, Settings, new(), 1, reviewBeforeFiling: true);
+        using var page = new Bitmap(12, 12);
+        queue.StorePage(draft.Id, 1, page);
+        queue.FinishCapture(draft.Id);
+        await queue.Approve(draft.Id, 1, documents, CancellationToken.None);
+        await queue.Transfer(draft.Id, CancellationToken.None);
+        Require(queue.Get(draft.Id).FiledCount == documents.Length, "An approved fixture did not file every PDF.");
+    }
+
     public static async Task Run(string workspace, string batchFixture, string reviewFixture)
     {
         var spool = Path.Combine(workspace, "spool");
@@ -14,6 +26,7 @@ internal static class QueueChecks
         using var engine = new DocumentEngine();
         Guid job;
         Guid interrupted;
+        Guid later;
         using (var queue = new FilingQueue(spool))
         {
             try
@@ -121,6 +134,11 @@ internal static class QueueChecks
             Require(queue.CanReprocess(queue.Get(job)) && File.Exists(queue.Original(job, 1)),
                 "A filed batch lost the ability to reprocess its original sides.");
         }
+        var manifest = Path.Combine(spool, job.ToString("N"), "batch.json");
+        var persisted = JsonSerializer.Deserialize<QueueBatch>(File.ReadAllText(manifest))!;
+        var legacy = persisted.Documents[^1];
+        persisted.Documents[^1] = legacy with { Outputs = [legacy.Outputs!.Single() with { FiledHash = null }] };
+        File.WriteAllText(manifest, JsonSerializer.Serialize(persisted));
         using (var queue = new FilingQueue(spool))
         {
             Require(queue.Get(job).FiledCount == 3 && !queue.Get(job).HasPending &&
@@ -130,16 +148,226 @@ internal static class QueueChecks
             queue.FinishCapture(empty, "No paper in feeder.");
             Require(queue.Batches.Where(batch => batch.IsFinished).Select(batch => batch.Id)
                 .ToHashSet().SetEquals(new[] { job, empty }), "Cleanup included an unfinished batch.");
+            var paths = queue.Get(job).Documents.SelectMany(doc => doc.Outputs!).Select(file => file.FiledPath!).ToArray();
+            var replacement = paths[0];
+            var original = File.ReadAllBytes(replacement);
+            File.WriteAllText(replacement, "Different PDF added after filing");
+            var unrelated = Path.Combine(destination, "Unrelated.pdf");
+            File.WriteAllText(unrelated, "Unrelated file");
+            using (File.Open(paths[1], FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                var partiallyCleared = await queue.ClearHistory(queue.History.ToArray());
+                Require(partiallyCleared.Failed == 2 && queue.History.Single().Id == job &&
+                    File.ReadAllText(replacement) == "Different PDF added after filing" && File.Exists(paths[1]) &&
+                    !File.Exists(paths[2]) && queue.Get(job).FiledCount == 2,
+                    "Clearing history hid a failure, deleted a different file, or failed to clear the unlocked PDF.");
+            }
+            File.WriteAllBytes(replacement, original);
+            var cleared = await queue.ClearHistory(queue.History.ToArray());
+            Require(cleared.Failed == 0 && !queue.History.Any() && paths.All(path => !File.Exists(path)) &&
+                queue.CanReprocess(queue.Get(job)) && queue.Get(interrupted).NeedsReview &&
+                File.Exists(queue.Original(interrupted, 1)) && File.Exists(unrelated),
+                "Clearing history did not delete the saved scans or changed files outside the confirmed records.");
             Require(queue.RemoveBatch(job) && queue.RemoveBatch(empty), "Finished history was not removed.");
-            Require(Directory.GetFiles(destination, "*.pdf").Length == 3 &&
+            Require(Directory.GetFiles(destination, "*.pdf").Length == 1 &&
                 File.Exists(queue.Original(interrupted, 1)), "Cleanup removed filed PDFs or another batch's original.");
+            later = queue.Begin(destination, false, Settings, new(), 1).Id;
+            queue.FinishCapture(later);
         }
         using (var queue = new FilingQueue(spool))
-            Require(queue.Batches.Single().Id == interrupted, "Removed entries returned after restarting.");
+        {
+            Require(queue.History.Single().Id == later &&
+                queue.Batches.Select(batch => batch.Id).ToHashSet().SetEquals(new[] { interrupted, later }),
+                "Cleared or deleted history returned after restarting, or a new batch was hidden.");
+            Require(queue.Get(interrupted).NeedsReview, "A cleared batch lost its review after restarting.");
+            queue.Redirect(interrupted, destination);
+            await foreach (var page in engine.Import(queue.Original(interrupted, 1)))
+            {
+                using (page)
+                using (var prepared = await engine.Prepare(page, null, Settings, CancellationToken.None))
+                    await queue.Approve(interrupted, 1, [[prepared]], CancellationToken.None);
+            }
+            await queue.Transfer(interrupted, CancellationToken.None);
+            Require(queue.History.Any(batch => batch.Id == interrupted && batch.FiledCount == 1),
+                "A newly delivered file stayed hidden after its pending batch was cleared from History.");
+        }
         await VerifyLegacyRecovery(workspace, engine, reviewFixture);
         await VerifyStopAndResume(workspace, engine, reviewFixture);
         await VerifyOcrTimeout(workspace, reviewFixture);
+        await VerifyPreparationSaveRetry(workspace);
+        VerifyCaptureSaveRetry(workspace);
+        await VerifyReviewDraftRecovery(workspace);
+        VerifyDeliverySelection(workspace);
+        await VerifyDriverDiscovery();
         Console.WriteLine("Verified queue recovery, idempotent delivery, pause and resume, finished cleanup and an OCR timeout fallback.");
+    }
+
+    private sealed class InlineProgress(Action<string> report) : IProgress<string>
+    {
+        public void Report(string value) => report(value);
+    }
+
+    private static async Task VerifyPreparationSaveRetry(string workspace)
+    {
+        using var queue = new FilingQueue(Path.Combine(workspace, "locked-status"));
+        var batch = queue.Begin(workspace, false, Settings, new(), 1);
+        using var page = new Bitmap(400, 580);
+        using (var drawing = Graphics.FromImage(page)) drawing.Clear(Color.White);
+        queue.StorePage(batch.Id, 1, page);
+        queue.FinishCapture(batch.Id);
+        FileStream? held = null;
+        try
+        {
+            var manifest = Path.Combine(Path.GetDirectoryName(queue.Original(batch.Id, 1))!, "batch.json");
+            await queue.Prepare(batch.Id, CancellationToken.None, stage: new InlineProgress(stage =>
+            {
+                if (stage == "Building PDFs") held = File.Open(manifest, FileMode.Open, FileAccess.Read, FileShare.Read);
+            }));
+            Require(queue.IsSavingPreparation(batch.Id) && queue.Get(batch.Id).Phase == BatchPhase.Processing,
+                "A locked manifest did not hold the completed result for retry.");
+        }
+        finally { held?.Dispose(); }
+        Require(queue.RetryPreparationSaves(batch.Id) && !queue.IsSavingPreparation(batch.Id) &&
+            queue.Get(batch.Id).Documents.Single().Disposition == QueueDisposition.SkippedBlank &&
+            File.Exists(queue.Original(batch.Id, 1)),
+            "Releasing the manifest lock did not save the original result without reprocessing.");
+    }
+
+    private static void VerifyCaptureSaveRetry(string workspace)
+    {
+        var spool = Path.Combine(workspace, "capture-record-lock");
+        Guid afterRestart;
+        Guid copyAfterRestart;
+        var edit = new PageEdit(1, Rotation: 90, Crop: true);
+        using (var queue = new FilingQueue(spool))
+        {
+            using var page = new Bitmap(24, 30);
+            Guid LockedCapture(ReviewDraft? draft = null)
+            {
+                var id = queue.Begin(workspace, false, Settings, new(), 1, reviewBeforeFiling: draft is not null).Id;
+                queue.StorePage(id, 1, page);
+                var manifest = Path.Combine(Path.GetDirectoryName(queue.Original(id, 1))!, "batch.json");
+                using (File.Open(manifest, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    queue.FinishCapture(id, draft: draft);
+                Require(queue.IsSavingPreparation(id) && queue.Get(id).Phase == BatchPhase.Capturing,
+                    "The locked capture record was not kept for retry.");
+                return id;
+            }
+            var retryInPlace = LockedCapture();
+            Require(queue.RetryPreparationSaves(retryInPlace) && queue.NextPreparation()?.Id == retryInPlace,
+                "The saved capture did not enter processing after the lock cleared.");
+            afterRestart = LockedCapture();
+            copyAfterRestart = LockedCapture(new ReviewDraft(Settings, [edit]));
+        }
+        using var recovered = new FilingQueue(spool);
+        Require(recovered.Get(afterRestart) is { Phase: BatchPhase.Queued, Pages: 1, ScanError: null },
+            "Restarting changed a completed capture into an interrupted scan.");
+        Require(recovered.Get(copyAfterRestart).Documents.Single().Draft?.Pages.Single() == edit,
+            "A locked capture record lost the recovered copy's edits.");
+    }
+
+    private static async Task VerifyReviewDraftRecovery(string workspace)
+    {
+        var spool = Path.Combine(workspace, "review-draft");
+        var destination = Path.Combine(workspace, "recoverable-destination");
+        Guid id;
+        var edited = new PageEdit(2, 90, Crop: true, BreakBefore: true, KeepBlank: true);
+        using (var queue = new FilingQueue(spool))
+        {
+            id = queue.Begin(destination, true, Settings, new(), 2, reviewBeforeFiling: true).Id;
+            using var page = new Bitmap(24, 30);
+            queue.StorePage(id, 1, page, new CaptureLayout(SheetSide.Front, 1));
+            queue.StorePage(id, 2, page, new CaptureLayout(SheetSide.Back, 1));
+            var captured = queue.FinishCapture(id);
+            Require(captured.NeedsReview && !captured.HasPending && queue.NextPreparation() is null,
+                "A user-requested review went straight to delivery.");
+            queue.SaveDraft(id, 1, new ReviewDraft(Settings, [edited, new PageEdit(1, Exclude: true)]));
+            queue.AppendReview(id);
+            queue.StorePage(id, 3, page, new CaptureLayout(SheetSide.Unpaired, 3));
+        }
+
+        using var reopened = new FilingQueue(spool);
+        var recovered = reopened.Get(id);
+        Require(recovered.Documents.Single().Draft?.Pages.SequenceEqual([edited, new PageEdit(1, Exclude: true), new PageEdit(3)]) == true &&
+            reopened.PageLayout(recovered, 2) == new CaptureLayout(SheetSide.Back, 1) &&
+            reopened.PageLayout(recovered, 3) == new CaptureLayout(SheetSide.Unpaired, 3),
+            "An interrupted append lost draft edits, source order, or duplex layout.");
+
+        var path = Path.Combine(workspace, "draft-content.pdf");
+        using (var pdf = new PdfSharpCore.Pdf.PdfDocument())
+        {
+            pdf.AddPage();
+            pdf.Save(path);
+        }
+        var pagePdf = new PreparedPage("", path, PageClues.FromText("Test", false), "Test", default, 0, true,
+            OwnsFiles: false, PdfImageReady: true);
+        ReviewDraft[] source = [new(Settings, [edited]), new(Settings, [new PageEdit(3)])];
+        await reopened.Approve(id, 1, [[pagePdf], [pagePdf]], CancellationToken.None, sources: source);
+        await reopened.Transfer(id, CancellationToken.None);
+        var pending = reopened.Get(id);
+        Require(pending.HasPending && pending.TransferError is not null && pending.Documents.Single().Draft is null,
+            "An offline destination lost an approved review or kept it editable for duplicate approval.");
+        Directory.CreateDirectory(destination);
+        var first = pending.Documents.Single().Outputs![0];
+        var spoolPdf = Path.Combine(Path.GetDirectoryName(reopened.Original(id, 1))!, first.LocalFile);
+        FilingQueue.Publish(spoolPdf, Path.Combine(destination, first.Name), CancellationToken.None);
+        await reopened.Transfer(id, CancellationToken.None);
+        var filed = reopened.Get(id);
+        Require(filed.FiledCount == 2 && Directory.GetFiles(destination, "*.pdf").Length == 2 &&
+            filed.Documents.Single().Outputs!.Select(file => file.Source!.Pages.Single()).SequenceEqual([edited, new PageEdit(3)]),
+            "Delivery retry duplicated a PDF or lost its exact source page and edits.");
+    }
+
+    private static void VerifyDeliverySelection(string workspace)
+    {
+        var spool = Path.Combine(workspace, "delivery-selection");
+        var share = Path.Combine(workspace, "slow");
+        Guid[] ids;
+        using (var seed = new FilingQueue(spool))
+        {
+            ids = new[] { share, share + Path.DirectorySeparatorChar, Path.Combine(workspace, "healthy") }
+                .Select((folder, index) =>
+                {
+                    var batch = seed.Begin(folder, false, Settings, new(), 1) with
+                    {
+                        Created = DateTimeOffset.UtcNow.AddMinutes(index),
+                        Phase = BatchPhase.Planned,
+                        Documents = [new QueueDocument(1, 1, 1, QueueDisposition.Ready,
+                            Outputs: [new QueueOutput("local.pdf", "scan.pdf")])]
+                    };
+                    File.WriteAllText(Path.Combine(spool, batch.Id.ToString("N"), "batch.json"),
+                        JsonSerializer.Serialize(batch));
+                    return batch.Id;
+                }).ToArray();
+        }
+        using var queue = new FilingQueue(spool);
+        Require(queue.NextTransfer()?.Id == ids[0] &&
+            queue.NextTransfer(new HashSet<Guid> { ids[0] })?.Id == ids[2] &&
+            queue.NextTransfer(new HashSet<Guid> { ids[0] }, ids[2]) is null,
+            "A busy destination blocked a different destination or took a second delivery slot.");
+    }
+
+    private static async Task VerifyDriverDiscovery()
+    {
+        var fast = new List<NAPS2.Scan.ScanDevice>();
+        var slow = new TaskCompletionSource<List<NAPS2.Scan.ScanDevice>>();
+        await using (var probes = DocumentEngine.AwaitDriverProbes([Task.FromResult(fast), slow.Task],
+            TimeSpan.FromMilliseconds(50), CancellationToken.None).GetAsyncEnumerator())
+        {
+            Require(await probes.MoveNextAsync() && ReferenceEquals(probes.Current, fast) &&
+                await probes.MoveNextAsync() && probes.Current is null,
+                "A working driver was not reported while a second probe stalled.");
+        }
+        using var stop = new CancellationTokenSource();
+        await using var canceled = DocumentEngine.AwaitDriverProbes([slow.Task], TimeSpan.FromMinutes(1),
+            stop.Token).GetAsyncEnumerator();
+        stop.Cancel();
+        try
+        {
+            await canceled.MoveNextAsync();
+            throw new InvalidOperationException("Cancel did not interrupt a stalled scanner discovery.");
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
     }
 
     private static async Task VerifyStopAndResume(string workspace, DocumentEngine engine, string fixture)
@@ -241,7 +469,14 @@ internal static class QueueChecks
             Require(pdf.PageCount == 2, "The recovered PDF lost one of the original sides.");
             filed = queue.Get(held.Id);
         }
-        File.WriteAllText(Path.Combine(spool, held.Id.ToString("N"), "batch.json"),
+        var manifest = Path.Combine(spool, held.Id.ToString("N"), "batch.json");
+        File.WriteAllText(manifest,
+            JsonSerializer.Serialize(filed with { OriginalsUntil = DateTimeOffset.UtcNow.AddDays(7).AddHours(-2) },
+                new JsonSerializerOptions { IgnoreReadOnlyProperties = true }));
+        using (var queue = new FilingQueue(spool))
+            Require(queue.CanReprocess(queue.Get(held.Id)) && queue.ReadPrepared(held.Id, 1) is null,
+                "The finished processing cache outlived its retention window or evicted the originals.");
+        File.WriteAllText(manifest,
             JsonSerializer.Serialize(filed with { OriginalsUntil = DateTimeOffset.UtcNow.AddSeconds(-1) },
                 new JsonSerializerOptions { IgnoreReadOnlyProperties = true }));
         using (var queue = new FilingQueue(spool))

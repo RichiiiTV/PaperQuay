@@ -2,6 +2,8 @@ using System.Globalization;
 
 namespace PaperQuay;
 
+internal readonly record struct OcrWordRegion(int X, int Y, int Width, int Height);
+
 internal readonly record struct OcrQuality(int Characters, double Confidence, int HorizontalLines = 0, int VerticalLines = 0)
 {
     public bool NeedsReview => Characters < 16 || Confidence < 78;
@@ -19,12 +21,15 @@ internal readonly record struct OcrQuality(int Characters, double Confidence, in
         (ImprovesOn(earlier) ||
          (earlier.VerticalLines > earlier.HorizontalLines && Characters >= earlier.Characters * 0.7));
 
-    public static OcrQuality FromTsv(string tsv)
+    public static OcrQuality FromTsv(string tsv) => FromTsv(tsv, out _);
+
+    public static OcrQuality FromTsv(string tsv, out OcrWordRegion[] weakWords)
     {
         var characters = 0;
         var confidence = 0d;
         var horizontal = 0;
         var vertical = 0;
+        var weak = new List<OcrWordRegion>();
         foreach (var entry in tsv.Split('\n'))
         {
             var fields = entry.Split('\t', 12);
@@ -42,7 +47,14 @@ internal readonly record struct OcrQuality(int Characters, double Confidence, in
             var length = fields[11].Count(char.IsLetterOrDigit);
             characters += length;
             confidence += length * value;
+            if (length > 0 && value < 73 && weak.Count < 256 &&
+                int.TryParse(fields[6], CultureInfo.InvariantCulture, out var x) && x >= 0 &&
+                int.TryParse(fields[7], CultureInfo.InvariantCulture, out var y) && y >= 0 &&
+                int.TryParse(fields[8], CultureInfo.InvariantCulture, out var wordWidth) && wordWidth > 0 &&
+                int.TryParse(fields[9], CultureInfo.InvariantCulture, out var wordHeight) && wordHeight > 0)
+                weak.Add(new OcrWordRegion(x, y, wordWidth, wordHeight));
         }
+        weakWords = weak.ToArray();
         return new OcrQuality(characters, characters == 0 ? 0 : confidence / characters, horizontal, vertical);
     }
 }

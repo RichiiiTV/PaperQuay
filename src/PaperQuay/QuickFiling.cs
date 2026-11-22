@@ -1,39 +1,32 @@
 namespace PaperQuay;
 
-internal sealed record QuickFilingOptions(bool DetectDocuments = false, bool SkipBlankBacks = true);
-internal sealed record QuickPage(PreparedPage Page, SheetSide Side, int Document);
+internal sealed record QuickFilingOptions(bool DetectDocuments = false, bool SkipBlankBacks = true,
+    bool? RemoveBlankPages = null, int SheetsPerDocument = 0)
+{
+    public bool RemovesEmptyPages => RemoveBlankPages ?? SkipBlankBacks;
+    public bool DetectByContent => DetectDocuments && SheetsPerDocument <= 0;
+
+    public bool Omits(PreparedPage page) => page.VerifiedBlank ? RemovesEmptyPages :
+        SkipBlankBacks && page.OmitSide;
+
+    public bool Omits(ReverseEvidence evidence) => evidence == ReverseEvidence.Empty && RemovesEmptyPages ||
+        evidence == ReverseEvidence.ShowThrough && SkipBlankBacks;
+}
 internal sealed record FilingPlan(PreparedPage[][] Documents, int OmittedBacks, string? ReviewReason = null,
     int WeakOcrPages = 0);
 
 internal static class QuickFiling
 {
-    public static FilingPlan Plan(IReadOnlyList<QuickPage> batch, QuickFilingOptions options)
+    public static FilingPlan Plan(PreparedPage[] kept, int omitted, bool detectDocuments, int document)
     {
-        if (batch.Count == 0)
-            return new FilingPlan([], 0, "The scanner did not return any pages.");
-        if (batch.All(page => page.Page.Clues.Blank))
-            return new FilingPlan([], 0, "All pages look blank.");
-
-        var groups = batch.GroupBy(page => options.DetectDocuments ? page.Document : 1).ToArray();
-        if (options.DetectDocuments)
-        {
-            foreach (var group in groups)
-            {
-                var content = group.Where(page => !page.Page.Clues.Blank).Select(page => page.Page).ToArray();
-                if (HasGroupingConflict(content))
-                    return new FilingPlan([], 0, $"Document {group.Key} has conflicting page numbers or references. Review the grouping.");
-            }
-        }
-
-        var omitted = 0;
-        var documents = groups.Select(group =>
-        {
-            var kept = group.Where(page => !options.SkipBlankBacks || !page.Page.OmitSide)
-                .Select(page => page.Page).ToArray();
-            omitted += group.Count() - kept.Length;
-            return kept;
-        }).Where(document => document.Length > 0).ToArray();
-        return new FilingPlan(documents, omitted, WeakOcrPages: batch.Count(page => page.Page.NeedsReview));
+        if (kept.Length == 0)
+            return new FilingPlan([], omitted, omitted == 0 ? "The scanner did not return any pages." : null);
+        if (kept.All(page => page.Clues.Blank && !page.VerifiedBlank && !page.ReviewSide))
+            return new FilingPlan([], omitted, "All pages look blank.");
+        if (detectDocuments && HasGroupingConflict(kept.Where(page => !page.VerifiedBlank).ToArray()))
+            return new FilingPlan([], omitted,
+                $"Document {document} has conflicting page numbers or references. Review the grouping.");
+        return new FilingPlan([kept], omitted, WeakOcrPages: kept.Count(page => page.NeedsReview));
     }
 
     private static bool HasGroupingConflict(PreparedPage[] pages)

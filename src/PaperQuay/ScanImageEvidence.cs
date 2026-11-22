@@ -3,13 +3,130 @@ using System.Drawing.Imaging;
 
 namespace PaperQuay;
 
-internal static class ScanImageEvidence
+internal enum ReverseEvidence { Content, Empty, ShowThrough, Ambiguous }
+
+internal static partial class ScanImageEvidence
 {
     private const int Grid = 192;
 
-    public static bool IsShowThrough(Bitmap front, Bitmap back)
+    internal static ReverseEvidence[] CheckSheet(Bitmap front, Bitmap? back, QuickFilingOptions options)
+    {
+        var first = IsEmptyPage(front) ? ReverseEvidence.Empty : ReverseEvidence.Content;
+        if (back is null) return [first];
+        var second = IsEmptyPage(back) ? ReverseEvidence.Empty : ReverseEvidence.Content;
+        if (first != ReverseEvidence.Content || second != ReverseEvidence.Content ||
+            (!options.RemovesEmptyPages && !options.SkipBlankBacks))
+            return [first, second];
+
+        second = InspectReverse(front, back, options.SkipBlankBacks);
+        if (second == ReverseEvidence.Content)
+            first = InspectReverse(back, front, options.SkipBlankBacks);
+        return [first, second];
+    }
+
+    public static bool IsEmptyPage(Bitmap image)
+    {
+        if (image.PixelFormat != PixelFormat.Format24bppRgb)
+        {
+            using var rgb = PaperCorrection.CopyToRgb(image);
+            return IsEmptyPage(rgb);
+        }
+        if (PaperCorrection.IsUniformPale(image)) return true;
+
+        // Neighboring tiles model gradual shading without averaging away a thin stroke.
+        var tile = Math.Clamp(Math.Min(image.Width, image.Height) / 90, 8, 48);
+        var columns = (image.Width + tile - 1) / tile;
+        var rows = (image.Height + tile - 1) / tile;
+        var paper = new int[columns * rows, 3];
+        var sampled = 0;
+        var darkSamples = 0;
+        PaperCorrection.VisitRows(image, false, (y, row) =>
+        {
+            if ((y & 3) != 0) return;
+            for (var x = 0; x < image.Width; x += 4)
+            {
+                var cell = y / tile * columns + x / tile;
+                sampled++;
+                if (Luma(row, x * 3) < 213) darkSamples++;
+                for (var channel = 0; channel < 3; channel++)
+                    paper[cell, channel] = Math.Max(paper[cell, channel], row[x * 3 + channel]);
+            }
+        });
+        var surrounding = new int[columns * rows, 3];
+        for (var y = 0; y < rows; y++)
+        for (var x = 0; x < columns; x++)
+        for (var ny = Math.Max(0, y - 1); ny <= Math.Min(rows - 1, y + 1); ny++)
+        for (var nx = Math.Max(0, x - 1); nx <= Math.Min(columns - 1, x + 1); nx++)
+        for (var channel = 0; channel < 3; channel++)
+            surrounding[y * columns + x, channel] = Math.Max(surrounding[y * columns + x, channel],
+                paper[ny * columns + nx, channel]);
+
+        const int markTile = 16;
+        var markColumns = image.Width / markTile + 2;
+        var marks = new int[markColumns * (image.Height / markTile + 2)];
+        var overlapping = new int[marks.Length];
+        var edgeShadows = CornerEdgeShadows(image);
+        int[]? leftRail = null, rightRail = null;
+        if (darkSamples <= sampled / 85)
+        {
+            int ToneAt(int x, int y)
+            {
+                var pixel = image.GetPixel(x, y);
+                return (30 * pixel.R + 59 * pixel.G + 11 * pixel.B) / 100;
+            }
+            leftRail = FeederRail(ToneAt, image.Width, image.Height, 0, image.Width / 22);
+            rightRail = FeederRail(ToneAt, image.Width, image.Height, image.Width - image.Width / 22, image.Width);
+        }
+        var railRadius = Math.Max(2, image.Width / 300);
+        var speckLimit = (int)Math.Clamp((long)image.Width * image.Height / 18000, 48, 320);
+        var specks = 0;
+        var hasContent = false;
+        PaperCorrection.VisitRows(image, false, (y, row) =>
+        {
+            if (hasContent) return;
+            var cellRow = y / tile * columns;
+            for (var x = 0; x < image.Width; x++)
+            {
+                var offset = x * 3;
+                var (b, g, r) = (row[offset], row[offset + 1], row[offset + 2]);
+                var cell = cellRow + x / tile;
+                var luma = Luma(row, offset);
+                if (luma >= 213 && Chroma(r, g, b) <= 29 &&
+                    surrounding[cell, 0] - b < 10 && surrounding[cell, 1] - g < 10 &&
+                    surrounding[cell, 2] - r < 10)
+                    continue;
+                if (edgeShadows.Contains(y * image.Width + x)) continue;
+                if (luma >= 210 && Chroma(r, g, b) <= 23 &&
+                    ((leftRail is not null && Math.Abs(x - leftRail[y]) <= railRadius) ||
+                     (rightRail is not null && Math.Abs(x - rightRail[y]) <= railRadius)))
+                    continue;
+                if (luma >= 191 && Chroma(r, g, b) <= 29 && ++specks <= speckLimit &&
+                    ++marks[y / markTile * markColumns + x / markTile] <= 5 &&
+                    ++overlapping[(y + 8) / markTile * markColumns + (x + 8) / markTile] <= 5)
+                    continue;
+                hasContent = true;
+                return;
+            }
+        });
+        if (!hasContent) return true;
+        if (darkSamples > sampled / 85) return false;
+        var ink = ReadInk(image, out var tone);
+        return InspectPunchedReverse(null, image, ink, tone, detectShowThrough: false) == ReverseEvidence.Empty;
+    }
+
+    public static bool IsShowThrough(Bitmap front, Bitmap back) =>
+        InspectReverse(front, back, detectShowThrough: true) == ReverseEvidence.ShowThrough;
+
+    public static ReverseEvidence InspectReverse(Bitmap front, Bitmap back, bool detectShowThrough)
     {
         var reverse = ReadInk(back, out var reversePaper);
+        if (detectShowThrough && MatchesShowThrough(front, back, reverse, reversePaper))
+            return ReverseEvidence.ShowThrough;
+        return InspectPunchedReverse(front, back, reverse, reversePaper, detectShowThrough);
+    }
+
+    private static bool MatchesShowThrough(Bitmap front, Bitmap back, int[] reverse, int reversePaper)
+    {
         if (reversePaper < 237 || reverse.Max() > 100) return false;
         var reverseBounds = Bounds(reverse, 7);
         if (reverseBounds.Width < 12 || reverseBounds.Height < 12 ||

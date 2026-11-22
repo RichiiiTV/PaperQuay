@@ -1,17 +1,75 @@
 using System.Diagnostics;
 using System.Drawing.Imaging;
 using System.Threading.Channels;
+using NAPS2.Images;
 using NAPS2.Scan;
 using PdfSharpCore.Pdf.IO;
 using PaperQuay;
 
 internal static class ScanImageChecks
 {
+    public static async Task CheckRetainedBatch(string folder)
+    {
+        var batch = System.Text.Json.JsonSerializer.Deserialize<QueueBatch>(File.ReadAllText(Path.Combine(folder, "batch.json")))!;
+        var evidence = new List<ReverseEvidence>();
+        for (var number = 1; number <= batch.Pages; number += batch.Duplex ? 2 : 1)
+        {
+            using var front = new Bitmap(Path.Combine(folder, $"page-{number:D6}.png"));
+            using var back = batch.Duplex && number < batch.Pages
+                ? new Bitmap(Path.Combine(folder, $"page-{number + 1:D6}.png")) : null;
+            evidence.AddRange(ScanImageEvidence.CheckSheet(front, back, batch.Filing));
+        }
+        Console.WriteLine($"Skipped sides: {string.Join(", ", Enumerable.Range(1, evidence.Count)
+            .Where(side => batch.Filing.Omits(evidence[side - 1])))}.");
+        var pages = new List<PreparedPage>();
+        using var engine = new DocumentEngine();
+        try
+        {
+            for (var side = 1; side <= evidence.Count; side++)
+            {
+                var classification = evidence[side - 1];
+                var prepared = batch.Filing.Omits(classification) ? PreparedPage.Omitted(classification) : await ReadSide(side);
+                pages.Add(prepared with { ReviewSide = classification == ReverseEvidence.Ambiguous });
+            }
+            foreach (var group in QueueRouting.Route(pages.ToArray(), batch.Duplex, batch.Filing))
+                Console.WriteLine($"Group {group.Number}: source sides {group.First}–{group.Last}, " +
+                    $"skipped {group.Plan.OmittedBacks}, review {group.Plan.ReviewReason is not null}.");
+        }
+        finally { foreach (var page in pages) page.Dispose(); }
+
+        async Task<PreparedPage> ReadSide(int side)
+        {
+            var cache = Directory.GetFiles(folder, $"prepared-v*-{side:D6}.json")
+                .OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault();
+            if (cache is not null)
+            {
+                using var data = System.Text.Json.JsonDocument.Parse(File.ReadAllText(cache));
+                var stored = System.Text.Json.JsonSerializer.Deserialize<PreparedPage>(data.RootElement.GetProperty("Page"))!;
+                if (!stored.OmitSide) return stored with { OwnsFiles = false };
+            }
+            await foreach (var image in engine.Import(Path.Combine(folder, $"page-{side:D6}.png")))
+                using (image)
+                    return await engine.Prepare(image, null, batch.Processing, CancellationToken.None, verifiedBlank: false);
+            throw new InvalidDataException($"Side {side} could not be read.");
+        }
+    }
     public static async Task Run(string folder)
     {
         var workspace = Directory.CreateDirectory(folder).FullName;
         VerifyPdfPixelScale(workspace);
         VerifyPaperProfiles();
+        var profile = new ScanProfile("Receipts", workspace, "A5", 400, 1, false, 2,
+            new ProcessingOptions(true, true, "eng"), new QuickFilingOptions(RemoveBlankPages: false, SheetsPerDocument: 3));
+        var restoredProfiles = OutputFolder.ParseProfiles(System.Text.Json.JsonSerializer.Serialize(new[]
+        {
+            profile, profile with { Name = "receipts" }, profile with { Name = "Invalid", Folder = "relative" }
+        }));
+        Require(restoredProfiles.SequenceEqual([profile]), "A saved scan profile did not round-trip or allowed duplicates.");
+        var quality = OcrQuality.FromTsv(
+            "5\t1\t1\t1\t1\t1\t30\t40\t50\t20\t60.0\tTotal\n" +
+            "5\t1\t1\t1\t1\t2\t90\t40\t50\t20\t97.0\t1234", out var highlights);
+        Require(quality.Characters == 9 && highlights.SequenceEqual([new OcrWordRegion(30, 40, 50, 20)]),
+            "OCR review did not keep only the low-confidence word's coordinates.");
         using var front = new Bitmap(1240, 1754, PixelFormat.Format24bppRgb);
         front.SetResolution(150, 150);
         using (var drawing = Graphics.FromImage(front))
@@ -112,9 +170,122 @@ internal static class ScanImageChecks
 
         var incomplete = queue.Begin(workspace, true, settings, new(), 2);
         queue.StorePage(incomplete.Id, 1, front);
+        queue.StorePage(incomplete.Id, 2, coloredGhost);
+        queue.StorePage(incomplete.Id, 3, front);
         var held = queue.FinishCapture(incomplete.Id);
         Require(held.NeedsReview && held.ScanError is not null && queue.NextPreparation() is null,
             "An incomplete duplex sheet was treated as complete.");
+
+        using var shaded = new Bitmap(front.Width, front.Height, PixelFormat.Format24bppRgb);
+        shaded.SetResolution(150, 150);
+        var paperBounds = new Rectangle(0, 0, shaded.Width, shaded.Height);
+        using (var drawing = Graphics.FromImage(shaded))
+        using (var shade = new System.Drawing.Drawing2D.LinearGradientBrush(paperBounds,
+            Color.FromArgb(252, 250, 248), Color.FromArgb(224, 226, 222), 90))
+            drawing.FillRectangle(shade, paperBounds);
+        shaded.SetPixel(845, 150, Color.FromArgb(220, 219, 218));
+        shaded.SetPixel(61, 1123, Color.FromArgb(210, 211, 209));
+        using var nearEmpty = WithSpot(shaded, fringe, gray);
+        Require(!PaperCorrection.IsUniformPale(nearEmpty) && ScanImageEvidence.IsEmptyPage(nearEmpty),
+            "Gradual shading, isolated scanner specks and a thin attached corner shadow kept an otherwise empty sheet.");
+        using var thinStroke = WithSpot(nearEmpty, new Rectangle(610, 820, 23, 1), Color.FromArgb(222, 222, 222));
+        Require(!ScanImageEvidence.IsEmptyPage(thinStroke), "A faint one-pixel pencil stroke was treated as dust.");
+        using var paleColor = WithSpot(nearEmpty, new Rectangle(620, 800, 8, 7), Color.FromArgb(234, 228, 253));
+        Require(!ScanImageEvidence.IsEmptyPage(paleColor), "A low-contrast colored mark was skipped.");
+        using var smallEdgeInk = WithSpot(nearEmpty, new Rectangle(0, 2, 13, 3), Color.FromArgb(78, 78, 78));
+        Require(!ScanImageEvidence.IsEmptyPage(smallEdgeInk), "A dark mark at the very edge was treated as shading.");
+        using var streaked = new Bitmap(1240, 1754, PixelFormat.Format24bppRgb);
+        streaked.SetResolution(150, 150);
+        using (var drawing = Graphics.FromImage(streaked))
+        using (var rail = new Pen(Color.FromArgb(229, 230, 232), 4))
+        {
+            drawing.Clear(Color.White);
+            drawing.DrawLine(rail, 32, 0, 10, streaked.Height - 1);
+        }
+        for (var y = 110; y < 1550; y += 155)
+        for (var x = 125; x < 1100; x += 125)
+            streaked.SetPixel(x, y, Color.FromArgb(220, 222, 221));
+        Require(ScanImageEvidence.IsEmptyPage(streaked),
+            "A full-length feeder streak or scattered scanner dust kept an otherwise blank back.");
+        using var edgeAnnotation = WithSpot(streaked, new Rectangle(35, 720, 21, 1), Color.FromArgb(225, 225, 225));
+        Require(!ScanImageEvidence.IsEmptyPage(edgeAnnotation), "The feeder streak hid independent writing near the edge.");
+
+        using var punched = new Bitmap(front.Width, front.Height, PixelFormat.Format24bppRgb);
+        punched.SetResolution(150, 150);
+        using (var drawing = Graphics.FromImage(punched))
+        using (var rail = new Pen(Color.FromArgb(228, 229, 231), 4))
+        using (var fold = new SolidBrush(Color.FromArgb(215, 215, 215)))
+        {
+            drawing.Clear(Color.White);
+            drawing.DrawLine(rail, 32, 0, 11, punched.Height - 1);
+            drawing.FillEllipse(Brushes.DimGray, 1182, 650, 32, 13);
+            drawing.FillEllipse(Brushes.DimGray, 1175, 1125, 31, 12);
+            for (var x = 160; x < 1030; x += 110)
+                drawing.FillRectangle(fold, x, 1170, 15, 2);
+        }
+        Require(ScanImageEvidence.InspectReverse(front, punched, detectShowThrough: false) == ReverseEvidence.Empty,
+            "A blank punched reverse with feeder and fold lines was kept when show-through removal was off.");
+        using var noRail = WithSpot(punched, new Rectangle(0, 0, 60, punched.Height), Color.White);
+        Require(ScanImageEvidence.IsEmptyPage(noRail), "Aligned binder holes required a feeder streak or a scanned front to skip the page.");
+        using var noRailWithInk = WithSpot(noRail, new Rectangle(490, 990, 25, 2), Color.FromArgb(229, 229, 229));
+        Require(!ScanImageEvidence.IsEmptyPage(noRailWithInk), "The punched-page detector skipped a faint note without a feeder streak.");
+        using var sloped = new Bitmap(punched.Width, punched.Height, PixelFormat.Format24bppRgb);
+        using (var drawing = Graphics.FromImage(sloped))
+        using (var fold = new Pen(Color.FromArgb(195, 195, 195), 2))
+        {
+            drawing.Clear(Color.White);
+            drawing.FillEllipse(Brushes.DimGray, 1182, 650, 32, 13);
+            drawing.FillEllipse(Brushes.DimGray, 1175, 1125, 31, 12);
+            for (var x = 125; x < 1110; x += 67)
+            {
+                drawing.DrawLine(fold, x, 720 - x / 70, x + 15, 720 - (x + 15) / 70);
+                drawing.DrawLine(fold, x, 1274 - x / 50, x + 15, 1274 - (x + 15) / 50);
+            }
+        }
+        using var slopedWithSpeck = WithSpot(sloped, new Rectangle(724, 801, 3, 4), Color.FromArgb(255, 255, 220));
+        Require(ScanImageEvidence.IsEmptyPage(slopedWithSpeck),
+            "Two slanted creases and a tiny bright speck kept an otherwise empty punched sheet.");
+        using var slopedWithNote = (Bitmap)slopedWithSpeck.Clone();
+        using (var drawing = Graphics.FromImage(slopedWithNote))
+        using (var pencil = new Pen(Color.FromArgb(205, 205, 205), 2))
+            drawing.DrawLine(pencil, 530, 1249, 560, 1270);
+        Require(!ScanImageEvidence.IsEmptyPage(slopedWithNote), "A pencil stroke crossing a slanted crease was skipped.");
+        using var annotated = WithSpot(punched, new Rectangle(490, 990, 25, 2), Color.FromArgb(229, 229, 229));
+        Require(ScanImageEvidence.InspectReverse(front, annotated, detectShowThrough: true) == ReverseEvidence.Content,
+            "A faint annotation on punched paper was removed along with scan artifacts.");
+        using var stamped = WithSpot(punched, new Rectangle(1179, 641, 16, 4), Color.FromArgb(185, 224, 247));
+        Require(ScanImageEvidence.InspectReverse(front, stamped, detectShowThrough: true) == ReverseEvidence.Content,
+            "A colored mark beside a binder hole was removed.");
+        using var markedFold = (Bitmap)punched.Clone();
+        using (var drawing = Graphics.FromImage(markedFold))
+        using (var pen = new Pen(Color.FromArgb(197, 197, 197)))
+            drawing.DrawLines(pen, new Point[] { new(488, 1171), new(493, 1173), new(513, 1169) });
+        using var paleFoldMark = (Bitmap)punched.Clone();
+        using (var drawing = Graphics.FromImage(paleFoldMark))
+        using (var pen = new Pen(Color.FromArgb(222, 222, 222)))
+            drawing.DrawLines(pen, new Point[] { new(488, 1171), new(493, 1173), new(513, 1169) });
+        var paleFoldEvidence = ScanImageEvidence.InspectReverse(front, paleFoldMark, detectShowThrough: true);
+        Require(paleFoldEvidence == ReverseEvidence.Ambiguous,
+            $"A light pencil mark crossing a fold was classified as {paleFoldEvidence}.");
+        var folded = queue.Begin(workspace, true, settings, new(), 2);
+        queue.StorePage(folded.Id, 1, front);
+        queue.StorePage(folded.Id, 2, markedFold);
+        queue.FinishCapture(folded.Id);
+        await queue.Prepare(folded.Id, CancellationToken.None);
+        Require(queue.Get(folded.Id).Documents.Single() is
+            { Disposition: QueueDisposition.Review, OmittedBacks: 0, DecisionPage: 2 },
+            "A pencil mark crossing a fold was filed without the marked side.");
+
+        var empty = queue.Begin(workspace, true, settings, new(DetectDocuments: true, SkipBlankBacks: false,
+            RemoveBlankPages: true), 2);
+        queue.StorePage(empty.Id, 1, nearEmpty);
+        queue.StorePage(empty.Id, 2, streaked);
+        queue.FinishCapture(empty.Id);
+        await queue.Prepare(empty.Id, CancellationToken.None);
+        var skipped = queue.Get(empty.Id);
+        Require(skipped.IsFinished && queue.CanReprocess(skipped) && skipped.Documents.Single() is
+            { Disposition: QueueDisposition.SkippedBlank, OmittedBacks: 2, Outputs: null },
+            "A fully empty duplex sheet did not skip both pages and retain both originals.");
 
         using var first = new PreparedPage("", "", PageClues.FromText("Unnumbered report", false),
             "", new OcrQuality(23, 93), 0, true);
@@ -128,8 +299,104 @@ internal static class ScanImageChecks
         Require(QueueRouting.Route([first, blank, second], false, new(DetectDocuments: true))
             .Select(doc => doc.Plan.Documents.Single().Length).SequenceEqual([1, 1]),
             "A blank separator failed to split unnumbered documents, or was filed itself.");
+        var uncertainGroup = QueueRouting.Route([first, second, blank, first], false, new(DetectDocuments: true));
+        Require(uncertainGroup is [{ DecisionPage: 2, Plan.ReviewReason: not null }, { Plan.Documents: [[_]] }],
+            "A separator accidentally approved an uncertain boundary between its preceding pages.");
         var options = new QuickFilingOptions(DetectDocuments: true);
+        var duplicateNumber = PageClues.FromText("Seite 1\nText der Mitteilung\nService | Seite 1 von 2", false);
+        Require(duplicateNumber is { Number: 1, Total: 2 },
+            "A short page number in the header erased the more precise footer.");
+        var invoiceReference = PageClues.FromText("RECHNUNG\nBestellnummer: OR-00412\nRechnung Nr. INV-20263", false);
+        Require(invoiceReference.Reference == "INV-20263",
+            "A related order number overrode the invoice's own reference.");
+        using var opening = first with
+        {
+            Clues = PageClues.FromText("Mitteilung\nSehr geehrte Damen und Herren,\nHiermit bestätigen wir den Eingang.", false)
+        };
+        using var closing = first with
+        {
+            Clues = PageClues.FromText("Diese Angaben gelten ab diesem Monat.\nMit freundlichen Grüßen\nIhr Serviceteam", false)
+        };
+        using var nextLetter = first with
+        {
+            Clues = PageClues.FromText("Bescheid\nGuten Tag,\nIhr Antrag ist eingegangen.\nMit besten Grüssen", false)
+        };
+        var letters = QueueRouting.Route([opening, blank, closing, blank, nextLetter, blank], true, options);
+        Require(letters.Length == 2 && letters.Select(doc => doc.Plan.Documents.Single().Length).SequenceEqual([2, 1]),
+            "An unnumbered letter was split or joined to the signed notice following it.");
+        Require(QueueRouting.Route([opening, blank, nextLetter, blank], true, options)
+            .Select(doc => doc.Plan.Documents.Single().Length).SequenceEqual([1, 1]),
+            "Two headed letter openings were merged when the first letter had no closing.");
+        using var shortNumbered = first with { Clues = duplicateNumber, Quality = new OcrQuality(12, 92) };
+        using var nextNumbered = first with { Clues = PageClues.FromText("Information\nSeite 2 von 2", false) };
+        var numbered = QueueRouting.Route([nextLetter, shortNumbered, nextNumbered], false, options);
+        Require(numbered.Length == 2 && numbered.Select(doc => doc.Plan.Documents.Single().Length).SequenceEqual([1, 2]),
+            "A short but reliable first-page footer could not separate the next numbered document.");
+        using (var letterQueue = new FilingQueue(Path.Combine(workspace, "letter-queue")))
+        {
+            var destination = Directory.CreateDirectory(Path.Combine(workspace, "letters")).FullName;
+            var printed = letterQueue.Begin(destination, true, settings, options, 3);
+            using var letterStart = PrintedLetter("Mitteilung", "Sehr geehrte Damen und Herren,", closing: false);
+            using var letterEnd = PrintedLetter("Weitere Informationen", "", closing: true);
+            using var notice = PrintedLetter("Bescheid", "Guten Tag,", closing: true);
+            Bitmap[] fronts = [letterStart, letterEnd, notice];
+            for (var i = 0; i < fronts.Length; i++)
+            {
+                letterQueue.StorePage(printed.Id, 2 * i + 1, fronts[i]);
+                letterQueue.StorePage(printed.Id, 2 * i + 2, i == 0 ? noRail : streaked);
+            }
+            letterQueue.FinishCapture(printed.Id);
+            await letterQueue.Prepare(printed.Id, CancellationToken.None);
+            await letterQueue.Transfer(printed.Id, CancellationToken.None);
+            var filedLetter = letterQueue.Get(printed.Id);
+            Require(filedLetter.FiledCount == 2 && filedLetter.Documents.Select(doc => doc.OmittedBacks).SequenceEqual([2, 1]),
+                "The printed duplex letter and notice did not file separately with their empty backs skipped.");
+            var counts = filedLetter.Documents.Select(doc =>
+            {
+                using var pdf = PdfReader.Open(doc.Outputs!.Single().FiledPath!, PdfDocumentOpenMode.Import);
+                return pdf.PageCount;
+            });
+            Require(counts.SequenceEqual([2, 1]), "The filed PDFs did not retain the printed pages in order.");
+        }
+        var fixedBatch = QueueRouting.Route([first, blank, second, blank, first, second], true,
+            new(SheetsPerDocument: 2));
+        Require(fixedBatch.Select(doc => (doc.First, doc.Last, Count: doc.Plan.Documents.Single().Length))
+            .SequenceEqual([(1, 4, 2), (5, 6, 2)]),
+            "Fixed sheet counts split a duplex sheet or used the number of remaining pages.");
+        var keepEmpty = options with { RemoveBlankPages = false };
+        Require(QueueRouting.Route([blank, first, blank], false, new()).Single() is
+                { ExcludedPages: [1, 3], Plan.OmittedBacks: 2 } skippedPages &&
+                skippedPages.Plan.Documents.Single().Length == 1,
+            "The default failed to skip verified empty pages in a single-sided batch.");
+        Require(QueueRouting.Route([first, blank, second], false, keepEmpty)
+                .Select(doc => doc.Plan.Documents.Single().Length).SequenceEqual([2, 1]),
+            "Turning empty-page removal off lost a separator sheet.");
+        Require(QueueRouting.Route([first, blank, blank, blank, second, blank], true, options)
+                .Select(doc => doc.Plan.Documents.Single().Length).SequenceEqual([1, 1]),
+            "A blank duplex sheet could not split the stack when both sides were verified.");
+        using var uncertain = blank with { VerifiedBlank = false };
+        Require(QueueRouting.Route([first, uncertain], false, new()).Single().Plan.Documents.Single().Length == 2,
+            "A page was silently skipped based only on the appearance or OCR blank signal.");
+        using var delivery = first with { Clues = PageClues.FromText("Lieferschein-Nr. LS-20261", false) };
+        using var nextDelivery = first with { Clues = PageClues.FromText("Lieferschein-Nr. LS-20262", false) };
+        var deliveries = QueueRouting.Route([delivery, nextDelivery], false, options);
+        Require(deliveries.Length == 2 && deliveries.All(doc => doc.Plan.Documents is [[_]]),
+            "Two distinct delivery note references required a repeated title to split.");
+        using var footer = first with { Clues = PageClues.FromText("Continuation\n2/2", false) };
+        Require(QueueRouting.Route([first, footer], false, options).Single().Plan.Documents.Single().Length == 2,
+            "A compact final page number did not keep two pages together.");
+        var backsWithFooters = QueueRouting.Route([first, blank, first, footer, second, footer, first, blank], true, options);
+        Require(backsWithFooters.Select(doc => (doc.First, doc.Last, doc.Plan.OmittedBacks))
+                .SequenceEqual([(1, 2, 1), (3, 4, 0), (5, 6, 0), (7, 8, 1)]) &&
+            backsWithFooters.All(doc => doc.Plan.ReviewReason is null),
+            "Repeated final-page numbers on duplex backs did not identify four documents around empty sides.");
+        Require(!DocumentGroups.Plan([new(first.Clues), new(second.Clues),
+                new(footer.Clues, PageNumberTrusted: false)])[1].Starts,
+            "An unreadable page-number footer split the preceding unnumbered pages.");
         using var firstNumbered = first with { Clues = PageClues.FromText("Rechnung\nSeite 1 von 3", false) };
+        using var differentRun = first with { Clues = PageClues.FromText("Rechnung\nSeite 1 von 2", false) };
+        Require(DocumentGroups.Plan([new(firstNumbered.Clues), new(differentRun.Clues)])[1].Starts,
+            "The same heading hid a page-number restart with a different total.");
         using var weakMiddle = second with { Quality = new OcrQuality(2, 42) };
         using var lastNumbered = first with { Clues = PageClues.FromText("Blatt 3 / 3", false) };
         Require(QueueRouting.Route([firstNumbered, weakMiddle, lastNumbered], false, options).Single().Plan
@@ -138,12 +405,42 @@ internal static class ScanImageChecks
         using var invoice = first with { Clues = PageClues.FromText("Rechnung\n1 von 1", false) };
         Require(QueueRouting.Route([letter, invoice], false, options).Length == 2,
             "A new title with restarted numbering did not split the document.");
+        Require(QueueRouting.Route([invoice, letter], false, options).Length == 2,
+            "A new title after an explicit final page did not split the document.");
+
+        var ambiguous = queue.Begin(workspace, false, settings, options, 2);
+        using var annotatedFront = WithSpot(front, new Rectangle(910, 900, 24, 24), Color.DarkBlue);
+        queue.StorePage(ambiguous.Id, 1, front);
+        queue.StorePage(ambiguous.Id, 2, annotatedFront);
+        queue.StorePage(ambiguous.Id, 3, nearEmpty);
+        queue.FinishCapture(ambiguous.Id);
+        await queue.Prepare(ambiguous.Id, CancellationToken.None);
+        Require(queue.Get(ambiguous.Id).Documents.Single() is { DecisionPage: 2, ReviewOmissions: [3] },
+            "The ambiguous fixture did not preserve its boundary and empty page for review.");
         Console.WriteLine("Verified mirrored show-through, faint independent ink, paper edges, crop and OCR, original retention, and safe grouping.");
     }
 
     private static void Require(bool condition, string message)
     {
         if (!condition) throw new InvalidOperationException(message);
+    }
+
+    private static Bitmap PrintedLetter(string title, string opening, bool closing)
+    {
+        var page = new Bitmap(1240, 1754, PixelFormat.Format24bppRgb);
+        page.SetResolution(150, 150);
+        using var drawing = Graphics.FromImage(page);
+        using var heading = new Font("Arial", 41, FontStyle.Bold, GraphicsUnit.Pixel);
+        using var copy = new Font("Arial", 30, FontStyle.Regular, GraphicsUnit.Pixel);
+        drawing.Clear(Color.White);
+        drawing.DrawString(title, heading, Brushes.Black, 125, 210);
+        drawing.DrawString(opening, copy, Brushes.Black, 125, 360);
+        for (var line = 0; line < 8; line++)
+            drawing.DrawString("Bitte bewahren Sie diese Bestätigung für Ihre Unterlagen auf.",
+                copy, Brushes.Black, 125, 460 + line * 88);
+        if (closing)
+            drawing.DrawString("Mit freundlichen Grüßen\nIhr Serviceteam", copy, Brushes.Black, 125, 1310);
+        return page;
     }
 
     private static Bitmap WithSpot(Bitmap image, Rectangle position, Color color)
@@ -216,7 +513,7 @@ internal static class ScanImageChecks
         var count = 0;
         try
         {
-            await foreach (var result in engine.Scan(device, PaperSource.Duplex, 300, deadline.Token))
+            await foreach (var result in engine.Scan(device, PaperSource.Duplex, 300, ScanPaper.Default, BitDepth.Color, deadline.Token))
             {
                 var received = watch.Elapsed;
                 using (result)

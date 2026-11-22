@@ -15,6 +15,8 @@ function Invoke-Check {
 
 & dotnet build $project -c Release -p:RestoreLockedMode=true
 if ($LASTEXITCODE -ne 0) { throw "PaperQuay build failed." }
+Invoke-Check --paper-sizes
+Invoke-Check --feeder-recovery (Join-Path $results 'feeder-recovery')
 Invoke-Check --image-evidence (Join-Path $results 'image-evidence')
 Invoke-Check --orientation (Join-Path $results 'orientation')
 
@@ -27,4 +29,29 @@ if ($IncludeQueue) {
     & python $fixture $review quality
     if ($LASTEXITCODE -ne 0) { throw "Could not generate the review fixture." }
     Invoke-Check --queue (Join-Path $results 'queue') $batch $review
+    Invoke-Check --review-ui (Join-Path $results 'image-evidence/queue')
+    Invoke-Check --batch $batch (Join-Path $results 'batch-export')
+
+    $junctionQueue = (New-Item -ItemType Directory -Path (Join-Path $results 'junction-queue')).FullName
+    $outside = (New-Item -ItemType Directory -Path (Join-Path $results 'junction-target')).FullName
+    $id = [guid]::NewGuid()
+    $sentinel = Join-Path $outside 'keep.txt'
+    Set-Content -LiteralPath $sentinel -Value 'Queue cleanup must not touch this file.'
+    @{
+        Id = $id
+        Created = [DateTimeOffset]::UtcNow.ToString('o')
+        Destination = $outside
+        Workers = 1
+        Pages = 0
+        Phase = 3
+        Documents = @()
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outside 'batch.json')
+    $junction = Join-Path $junctionQueue $id.ToString('N')
+    New-Item -ItemType Junction -Path $junction -Target $outside | Out-Null
+    try {
+        Invoke-Check --check-queue-junction $junctionQueue
+        if (!(Test-Path -LiteralPath $sentinel)) { throw 'Queue cleanup followed a junction.' }
+    } finally {
+        Remove-Item -LiteralPath $junction -ErrorAction Stop
+    }
 }
