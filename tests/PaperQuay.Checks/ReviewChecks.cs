@@ -316,6 +316,28 @@ internal static class ReviewChecks
             throw new InvalidOperationException("Clearing history closed an open review.");
         Console.WriteLine("Verified clearing History with pending scans and an open review.");
 
+        var draft = queue.Begin(finished.Destination, false, finished.Processing, finished.Filing, finished.Workers, reviewBeforeFiling: true);
+        using (var page = new Bitmap(queue.Original(finished.Id, 1)))
+            queue.StorePage(draft.Id, 1, page);
+        queue.FinishCapture(draft.Id);
+        Children(window).OfType<Button>().Single(button =>
+            button.Text.StartsWith("Needs a decision", StringComparison.Ordinal)).PerformClick();
+        batches.Items.Cast<ListViewItem>().Single(row => Equals(row.Tag, draft.Id)).Selected = true;
+        review.PerformClick();
+        await WaitFor(() => Children(window).OfType<Button>().Any(button =>
+                button.Text == "Approve & file" && button.Visible && button.Enabled),
+            "The one-page draft did not open.");
+        Button("Review tools").PerformClick();
+        Button("Remove page").PerformClick();
+        await WaitFor(() => queue.Get(draft.Id).Documents.Single().Draft is { Pages.Length: 0 },
+            "The removed page was not saved.");
+        Children(window).OfType<Button>().Single(button =>
+            button.Text.StartsWith("Needs a decision", StringComparison.Ordinal)).PerformClick();
+        var discard = Button("Discard document…");
+        if (!discard.Enabled || !discard.Visible)
+            throw new InvalidOperationException("The empty draft could not be dismissed from the decision queue.");
+        Console.WriteLine("Verified the final page can be removed without trapping the review in the queue.");
+
         string foldedOutput() => queue.Get(folded.Id).Documents.Single().Outputs!.Single().FiledPath!;
 
         string[] ClearWithConfirmation(bool delete)

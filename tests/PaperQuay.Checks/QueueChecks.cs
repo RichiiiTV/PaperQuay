@@ -91,7 +91,7 @@ internal static class QueueChecks
                 "Interrupted capture was not restored for manual review.");
 
             Directory.CreateDirectory(destination);
-            queue.Redirect(job, destination);
+            await queue.Redirect(job, destination);
             var firstOutput = resumed.Documents[0].Outputs![0];
             var pendingFile = Path.Combine(spool, job.ToString("N"), firstOutput.LocalFile);
             var postedFile = Path.Combine(destination, firstOutput.Name);
@@ -105,13 +105,15 @@ internal static class QueueChecks
             catch (IOException) { }
             Require(File.ReadAllText(conflict) == "Original file content", "Existing destination bytes were changed.");
             File.Delete(conflict);
-            File.WriteAllText(Path.Combine(destination, $".scan-{Path.GetFileNameWithoutExtension(pendingFile)}.tmp"),
-                "Interrupted network copy");
+            var stale = Path.Combine(destination, $".scan-{Path.GetFileNameWithoutExtension(pendingFile)}.tmp");
+            File.WriteAllText(stale, "Interrupted network copy");
             FilingQueue.Publish(pendingFile, postedFile, CancellationToken.None);
             await queue.Transfer(job, CancellationToken.None);
             var delivered = queue.Get(job);
-            Require(delivered.FiledCount == 2 && Directory.GetFiles(destination, "*.pdf").Length == 2,
-                "Idempotent delivery failed to account for a PDF written before a restart.");
+            Require(delivered.FiledCount == 2 && Directory.GetFiles(destination, "*.pdf").Length == 2 &&
+                File.ReadAllText(stale) == "Interrupted network copy",
+                "Idempotent delivery lost the earlier PDF or touched a staging file it did not create.");
+            File.Delete(stale);
             var review = delivered.Documents.Single(doc => doc.Disposition == QueueDisposition.Review);
             Require(File.Exists(queue.Original(job, review.FirstPage - 1)) &&
                 File.Exists(queue.Original(job, review.LastPage + 1)),
@@ -151,7 +153,19 @@ internal static class QueueChecks
             var paths = queue.Get(job).Documents.SelectMany(doc => doc.Outputs!).Select(file => file.FiledPath!).ToArray();
             var replacement = paths[0];
             var original = File.ReadAllBytes(replacement);
+            var delivered = queue.Get(job).Documents[0].Outputs![0];
+            var snapshot = engine.SnapshotFiledPdf(delivered, CancellationToken.None);
+            Require(File.ReadAllBytes(snapshot).SequenceEqual(original), "The verified PDF snapshot changed the contents.");
             File.WriteAllText(replacement, "Different PDF added after filing");
+            try
+            {
+                engine.SnapshotFiledPdf(delivered, CancellationToken.None);
+                throw new InvalidOperationException("History opened a changed PDF as if it were the original.");
+            }
+            catch (IOException) { }
+            Require(File.ReadAllBytes(snapshot).SequenceEqual(original), "The opened copy still depended on the shared PDF.");
+            DocumentEngine.DeleteScratchFile(snapshot);
+            File.WriteAllText(paths[2], "Unverified replacement file");
             var unrelated = Path.Combine(destination, "Unrelated.pdf");
             File.WriteAllText(unrelated, "Unrelated file");
             using (File.Open(paths[1], FileMode.Open, FileAccess.Read, FileShare.Read))
@@ -159,17 +173,18 @@ internal static class QueueChecks
                 var partiallyCleared = await queue.ClearHistory(queue.History.ToArray());
                 Require(partiallyCleared.Failed == 2 && queue.History.Single().Id == job &&
                     File.ReadAllText(replacement) == "Different PDF added after filing" && File.Exists(paths[1]) &&
-                    !File.Exists(paths[2]) && queue.Get(job).FiledCount == 2,
-                    "Clearing history hid a failure, deleted a different file, or failed to clear the unlocked PDF.");
+                    partiallyCleared.Unverified == 1 && File.ReadAllText(paths[2]) == "Unverified replacement file" &&
+                    queue.Get(job).FiledCount == 2,
+                    "Clearing history hid a failure or deleted an unverified replacement.");
             }
             File.WriteAllBytes(replacement, original);
             var cleared = await queue.ClearHistory(queue.History.ToArray());
-            Require(cleared.Failed == 0 && !queue.History.Any() && paths.All(path => !File.Exists(path)) &&
+            Require(cleared.Failed == 0 && !queue.History.Any() && paths.Take(2).All(path => !File.Exists(path)) &&
                 queue.CanReprocess(queue.Get(job)) && queue.Get(interrupted).NeedsReview &&
                 File.Exists(queue.Original(interrupted, 1)) && File.Exists(unrelated),
                 "Clearing history did not delete the saved scans or changed files outside the confirmed records.");
             Require(queue.RemoveBatch(job) && queue.RemoveBatch(empty), "Finished history was not removed.");
-            Require(Directory.GetFiles(destination, "*.pdf").Length == 1 &&
+            Require(Directory.GetFiles(destination, "*.pdf").Length == 2 && File.Exists(paths[2]) &&
                 File.Exists(queue.Original(interrupted, 1)), "Cleanup removed filed PDFs or another batch's original.");
             later = queue.Begin(destination, false, Settings, new(), 1).Id;
             queue.FinishCapture(later);
@@ -180,7 +195,7 @@ internal static class QueueChecks
                 queue.Batches.Select(batch => batch.Id).ToHashSet().SetEquals(new[] { interrupted, later }),
                 "Cleared or deleted history returned after restarting, or a new batch was hidden.");
             Require(queue.Get(interrupted).NeedsReview, "A cleared batch lost its review after restarting.");
-            queue.Redirect(interrupted, destination);
+            await queue.Redirect(interrupted, destination);
             await foreach (var page in engine.Import(queue.Original(interrupted, 1)))
             {
                 using (page)
@@ -197,6 +212,7 @@ internal static class QueueChecks
         await VerifyPreparationSaveRetry(workspace);
         VerifyCaptureSaveRetry(workspace);
         await VerifyReviewDraftRecovery(workspace);
+        await VerifyRedirectAfterPublication(workspace);
         VerifyDeliverySelection(workspace);
         await VerifyDriverDiscovery();
         Console.WriteLine("Verified queue recovery, idempotent delivery, pause and resume, finished cleanup and an OCR timeout fallback.");
@@ -316,6 +332,45 @@ internal static class QueueChecks
         Require(filed.FiledCount == 2 && Directory.GetFiles(destination, "*.pdf").Length == 2 &&
             filed.Documents.Single().Outputs!.Select(file => file.Source!.Pages.Single()).SequenceEqual([edited, new PageEdit(3)]),
             "Delivery retry duplicated a PDF or lost its exact source page and edits.");
+    }
+
+    private static async Task VerifyRedirectAfterPublication(string workspace)
+    {
+        foreach (var legacy in new[] { false, true })
+        {
+            var root = Directory.CreateDirectory(Path.Combine(workspace, legacy ? "legacy-redirect" : "recorded-redirect")).FullName;
+            var previous = Directory.CreateDirectory(Path.Combine(root, "previous")).FullName;
+            var destination = Directory.CreateDirectory(Path.Combine(root, "destination")).FullName;
+            var id = Guid.NewGuid();
+            var spool = Path.Combine(root, "spool");
+            var folder = Directory.CreateDirectory(Path.Combine(spool, id.ToString("N"))).FullName;
+            var firstPath = Path.Combine(previous, "first.pdf");
+            QueueOutput first = new("first-local.pdf", "first.pdf", AttemptedPath: legacy ? null : firstPath);
+            QueueOutput second = new("second-local.pdf", "second.pdf");
+            var record = new QueueBatch(id, DateTimeOffset.UtcNow, previous, false, Settings, new(), 1)
+            {
+                Phase = BatchPhase.Planned,
+                Pages = 1,
+                Documents = [new QueueDocument(1, 1, 1, QueueDisposition.Ready, Outputs: [first, second])]
+            };
+            File.WriteAllText(Path.Combine(folder, "batch.json"), JsonSerializer.Serialize(record));
+            foreach (var file in new[] { first, second })
+            {
+                using var pdf = new PdfSharpCore.Pdf.PdfDocument();
+                pdf.AddPage();
+                pdf.Save(Path.Combine(folder, file.LocalFile));
+            }
+            var hash = FilingQueue.Publish(Path.Combine(folder, first.LocalFile), firstPath, CancellationToken.None);
+            using var queue = new FilingQueue(spool);
+            await queue.Redirect(id, destination);
+            Require(queue.Get(id).Documents.Single().Outputs![0] is { FiledPath: not null } saved &&
+                saved.FiledPath == firstPath && saved.FiledHash == hash,
+                "Redirecting lost a PDF that reached the previous folder before the queue save.");
+            await queue.Transfer(id, CancellationToken.None);
+            Require(queue.Get(id).FiledCount == 2 && Directory.GetFiles(previous).SequenceEqual([firstPath]) &&
+                Directory.GetFiles(destination).SequenceEqual([Path.Combine(destination, second.Name)]),
+                "Redirecting copied a previously filed PDF again or lost an undelivered PDF.");
+        }
     }
 
     private static void VerifyDeliverySelection(string workspace)

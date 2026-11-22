@@ -3,6 +3,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using NAPS2.Images;
 using NAPS2.Images.Gdi;
@@ -28,8 +29,9 @@ internal sealed class DocumentEngine : IDisposable
     public DocumentEngine(TimeSpan? ocrBudget = null)
     {
         this.ocrBudget = ocrBudget ?? TimeSpan.FromSeconds(25);
-        scratch = FileStorageManager.CreateFolder(
-            Path.Combine(Path.GetTempPath(), $"PaperQuay-{Guid.NewGuid():N}"));
+        scratch = FileStorageManager.CreateFolder(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "PaperQuay", "Scratch", Guid.NewGuid().ToString("N")));
         context = new ScanningContext(imaging)
         {
             FileStorageManager = scratch,
@@ -179,6 +181,41 @@ internal sealed class DocumentEngine : IDisposable
 
     public IAsyncEnumerable<ProcessedImage> Import(string path) =>
         new FileImporter(context).Import(path);
+
+    public string SnapshotFiledPdf(QueueOutput file, CancellationToken token)
+    {
+        if (file.FiledPath is not { } path || !Path.IsPathFullyQualified(path) ||
+            !string.Equals(Path.GetExtension(path), ".pdf", StringComparison.OrdinalIgnoreCase))
+            throw new IOException("The filed PDF path is invalid.");
+        if (file.FiledHash is not { } expected)
+            throw new IOException("This old scan has no recorded PDF fingerprint. Use Open folder to inspect it.");
+
+        using var handle = WindowsFiles.OpenRead(path);
+        using var input = new FileStream(handle, FileAccess.Read);
+        var copy = Path.Combine(scratch.FolderPath, $"{Guid.NewGuid():N}.pdf");
+        try
+        {
+            using var output = new FileStream(copy, FileMode.CreateNew, FileAccess.Write);
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = new byte[128 * 1024];
+            int count;
+            while ((count = input.Read(buffer, 0, buffer.Length)) != 0)
+            {
+                token.ThrowIfCancellationRequested();
+                hash.AppendData(buffer, 0, count);
+                output.Write(buffer, 0, count);
+            }
+            token.ThrowIfCancellationRequested();
+            if (Convert.ToHexString(hash.GetHashAndReset()) != expected)
+                throw new IOException("The filed PDF has changed since PaperQuay saved it.");
+            return copy;
+        }
+        catch
+        {
+            DeleteScratchFile(copy);
+            throw;
+        }
+    }
 
     public Bitmap Preview(ProcessedImage page) => imaging.RenderToBitmap(page);
 

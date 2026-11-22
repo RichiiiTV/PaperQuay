@@ -14,7 +14,7 @@ internal sealed record PageEdit(int Source, int? Rotation = null, bool Crop = fa
 internal sealed record ReviewDraft(ProcessingOptions Processing, PageEdit[] Pages);
 
 internal sealed record QueueOutput(string LocalFile, string Name, string? FiledPath = null, string? FiledHash = null,
-    ReviewDraft? Source = null);
+    ReviewDraft? Source = null, string? AttemptedPath = null);
 internal sealed record QueueDocument(int Number, int FirstPage, int LastPage, QueueDisposition Disposition,
     string? Reason = null, QueueOutput[]? Outputs = null, int OmittedBacks = 0, int WeakOcrPages = 0,
     int[]? ReviewOmissions = null, bool FromAutomaticPages = false, int? DecisionPage = null, ReviewDraft? Draft = null);
@@ -120,9 +120,10 @@ internal sealed partial class FilingQueue : IDisposable
     public IEnumerable<QueueBatch> History => Batches.Where(batch => !(batch.HistoryHidden ?? hiddenHistory.Contains(batch.Id)));
     public QueueBatch Get(Guid id) => batches[id];
 
-    public async Task<(int Failed, string? Error)> ClearHistory(QueueBatch[] history)
+    public async Task<(int Failed, string? Error, int Unverified)> ClearHistory(QueueBatch[] history)
     {
         var failed = 0;
+        var unverified = 0;
         string? error = null;
         foreach (var batch in history)
         {
@@ -136,7 +137,8 @@ internal sealed partial class FilingQueue : IDisposable
                     {
                         try
                         {
-                            DeleteFiledPdf(batch.Id, file);
+                            if (file.FiledHash is null) unverified++;
+                            else DeleteFiledPdf(batch.Id, file, file.FiledHash);
                             deleted.Add(file);
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
@@ -167,10 +169,10 @@ internal sealed partial class FilingQueue : IDisposable
                 error ??= $"Couldn't save the updated batch record. {ex.Message}";
             }
         }
-        return (failed, error);
+        return (failed, error, unverified);
     }
 
-    private static void DeleteFiledPdf(Guid id, QueueOutput file)
+    private static void DeleteFiledPdf(Guid id, QueueOutput file, string expected)
     {
         var path = file.FiledPath!;
         var name = SafeFileName(file.Name);
@@ -179,15 +181,11 @@ internal sealed partial class FilingQueue : IDisposable
             throw new IOException("The recorded path does not match this scan.");
         try
         {
-            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
-                throw new IOException("The saved PDF path now points to a link.");
-            if (file.FiledHash is { } expected)
-            {
-                using var input = File.OpenRead(path);
-                if (Convert.ToHexString(SHA256.HashData(input)) != expected)
-                    throw new IOException("The PDF has changed since it was saved.");
-            }
-            File.Delete(path);
+            using var handle = WindowsFiles.OpenRead(path, forDeletion: true);
+            using var input = new FileStream(handle, FileAccess.Read);
+            if (Convert.ToHexString(SHA256.HashData(input)) != expected)
+                throw new IOException("The PDF has changed since it was saved.");
+            WindowsFiles.Delete(handle, path);
         }
         catch (FileNotFoundException) { }
     }
@@ -538,19 +536,25 @@ internal sealed partial class FilingQueue : IDisposable
         {
             token.ThrowIfCancellationRequested();
             batch = Get(id);
-            var destination = Path.Combine(batch.Destination, SafeFileName(file.Name));
+            var destination = file.AttemptedPath ?? Path.Combine(batch.Destination, SafeFileName(file.Name));
             try
             {
-                var hash = await Task.Run(() => Publish(SpoolFile(id, file.LocalFile), destination, token), token);
-                var current = Get(id);
-                var group = current.Documents.Single(doc => doc.Number == number);
-                var filed = group with { Outputs = group.Outputs!.Select(item =>
-                    item.LocalFile == file.LocalFile ? item with { FiledPath = destination, FiledHash = hash } : item).ToArray() };
-                Store(current with
+                if (file.AttemptedPath is null)
                 {
-                    Documents = Replace(current.Documents, filed), TransferError = null, HistoryHidden = false,
+                    await Task.Run(() =>
+                    {
+                        if ((File.GetAttributes(batch.Destination) & FileAttributes.Directory) == 0)
+                            throw new DirectoryNotFoundException(batch.Destination);
+                    }, token);
+                    // A crash after the PDF is published must still leave its original target in the queue.
+                    UpdateOutput(Get(id), number, file with { AttemptedPath = destination });
+                }
+                var hash = await Task.Run(() => Publish(SpoolFile(id, file.LocalFile), destination, token), token);
+                UpdateOutput(Get(id) with
+                {
+                    TransferError = null, HistoryHidden = false,
                     RetryAfter = DateTimeOffset.MinValue
-                });
+                }, number, file with { FiledPath = destination, FiledHash = hash, AttemptedPath = null });
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -567,63 +571,110 @@ internal sealed partial class FilingQueue : IDisposable
         ReleaseFinished(Get(id));
     }
 
+    private void UpdateOutput(QueueBatch batch, int number, QueueOutput output)
+    {
+        var group = batch.Documents.Single(doc => doc.Number == number);
+        Store(batch with { Documents = Replace(batch.Documents, group with
+        {
+            Outputs = group.Outputs!.Select(file => file.LocalFile == output.LocalFile ? output : file).ToArray()
+        }) });
+    }
+
+    private static (bool Exists, string? Hash) ComparePublished(string localFile, string destination)
+    {
+        try
+        {
+            using var handle = WindowsFiles.OpenRead(destination);
+            using var existing = new FileStream(handle, FileAccess.Read);
+            using var source = File.OpenRead(localFile);
+            if (source.Length != existing.Length) return (true, null);
+            var hash = SHA256.HashData(source);
+            return (true, hash.SequenceEqual(SHA256.HashData(existing)) ? Convert.ToHexString(hash) : null);
+        }
+        catch (FileNotFoundException ex) when (string.Equals(ex.FileName, destination, StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, null);
+        }
+    }
+
     internal static string Publish(string localFile, string destination, CancellationToken token)
     {
-        string? MatchingHash()
-        {
-            using var source = File.OpenRead(localFile);
-            using var existing = File.OpenRead(destination);
-            if (source.Length != existing.Length) return null;
-            var hash = SHA256.HashData(source);
-            return hash.SequenceEqual(SHA256.HashData(existing)) ? Convert.ToHexString(hash) : null;
-        }
-
         token.ThrowIfCancellationRequested();
-        var temporary = Path.Combine(Path.GetDirectoryName(destination)!,
-            $".scan-{Path.GetFileNameWithoutExtension(localFile)}.tmp");
-        if (File.Exists(destination))
-        {
-            if (MatchingHash() is { } existingHash)
-            {
-                TryDelete(temporary);
-                return existingHash;
-            }
-            throw new IOException("A different PDF already has the target name. Choose another folder or resolve the conflict.");
-        }
+        var existing = ComparePublished(localFile, destination);
+        if (existing.Exists)
+            return existing.Hash ?? throw new IOException("A different PDF already has the target name. Choose another folder or resolve the conflict.");
+
+        var temporary = Path.Combine(Path.GetDirectoryName(destination)!, $".scan-{Guid.NewGuid():N}.tmp");
+        using var source = File.OpenRead(localFile);
+        using var handle = WindowsFiles.CreateStaging(temporary);
+        using var target = new FileStream(handle, FileAccess.Write);
+        var published = false;
         try
         {
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            using (var source = File.OpenRead(localFile))
-            // The stable staging name lets a retry replace its own incomplete copy after a crash.
-            using (var target = new FileStream(temporary, FileMode.Create, FileAccess.Write))
+            var buffer = new byte[128 * 1024];
+            int read;
+            while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
             {
-                var buffer = new byte[128 * 1024];
-                int read;
-                while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
-                {
-                    token.ThrowIfCancellationRequested();
-                    hash.AppendData(buffer, 0, read);
-                    target.Write(buffer, 0, read);
-                }
-                target.Flush(flushToDisk: true);
+                token.ThrowIfCancellationRequested();
+                hash.AppendData(buffer, 0, read);
+                target.Write(buffer, 0, read);
             }
+            target.Flush(flushToDisk: true);
             token.ThrowIfCancellationRequested();
-            try { File.Move(temporary, destination); }
-            catch (IOException) when (File.Exists(destination) && MatchingHash() is not null) { }
+            WindowsFiles.Publish(handle, destination);
+            published = true;
             return Convert.ToHexString(hash.GetHashAndReset());
         }
         finally
         {
-            TryDelete(temporary);
+            if (!published)
+            {
+                try { WindowsFiles.Delete(handle, temporary); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            }
         }
     }
 
     public void Retry(Guid id) => Store(Get(id) with { RetryAfter = DateTimeOffset.MinValue });
 
-    public void Redirect(Guid id, string directory) => Store(Get(id) with
+    public async Task Redirect(Guid id, string directory, CancellationToken token = default)
     {
-        Destination = Path.GetFullPath(directory), RetryAfter = DateTimeOffset.MinValue, TransferError = null
-    });
+        var destination = Path.GetFullPath(directory);
+        var batch = Get(id);
+        if (string.Equals(Path.TrimEndingDirectorySeparator(batch.Destination),
+                Path.TrimEndingDirectorySeparator(destination), StringComparison.OrdinalIgnoreCase))
+        {
+            Retry(id);
+            return;
+        }
+        var reconciled = await Task.Run(() => batch.Documents.SelectMany(doc => doc.Outputs ?? [])
+            .Where(file => file.FiledPath is null).ToDictionary(file => file.LocalFile, file =>
+            {
+                token.ThrowIfCancellationRequested();
+                var attempted = file.AttemptedPath ?? Path.Combine(batch.Destination, SafeFileName(file.Name));
+                string? hash;
+                try { hash = ComparePublished(SpoolFile(id, file.LocalFile), attempted).Hash; }
+                catch (DirectoryNotFoundException) when (file.AttemptedPath is null) { hash = null; }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    throw new IOException($"Could not verify delivery in the previous folder. {ex.Message}", ex);
+                }
+                return file with { FiledPath = hash is null ? null : attempted, FiledHash = hash, AttemptedPath = null };
+            }), token);
+        token.ThrowIfCancellationRequested();
+        var current = Get(id);
+        Store(current with
+        {
+            Documents = current.Documents.Select(doc => doc with
+            {
+                Outputs = doc.Outputs?.Select(file => reconciled.GetValueOrDefault(file.LocalFile, file)).ToArray()
+            }).ToArray(),
+            Destination = destination, RetryAfter = DateTimeOffset.MinValue, TransferError = null,
+            HistoryHidden = reconciled.Values.Any(file => file.FiledPath is not null) ? false : current.HistoryHidden
+        });
+        ReleaseFinished(Get(id));
+    }
 
     public bool RemoveBatch(Guid id)
     {

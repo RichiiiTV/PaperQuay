@@ -6,6 +6,10 @@ $artifacts = Join-Path $root 'artifacts'
 $bundle = Join-Path $artifacts "PaperQuay-$version"
 $releaseLock = Join-Path $artifacts "publish-$([guid]::NewGuid().ToString('N')).lock.json"
 New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
+$artifactRoot = Get-Item -LiteralPath $artifacts
+if ($artifactRoot.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    throw 'The artifacts directory must be inside this checkout.'
+}
 
 # win-x64 introduces no additional application packages. Keep the Windows bundle locked to the same versions.
 $lock = Get-Content (Join-Path $project 'packages.lock.json') -Raw | ConvertFrom-Json
@@ -37,5 +41,45 @@ foreach ($pack in $runtimePacks) {
     if (!$packFolder) { throw "Could not find the runtime pack $package $packageVersion." }
     Get-ChildItem -LiteralPath $packFolder -File | Where-Object { $_.Name -match '^(LICENSE|THIRD-PARTY-NOTICES)(\.TXT)?$' } |
         ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $licenses "$package-$($_.Name)") }
+}
+
+$currentExe = Get-Item -LiteralPath (Join-Path $bundle 'PaperQuay.exe')
+$currentVersion = [version]$currentExe.VersionInfo.FileVersion
+$runningPaths = (Get-Process -Name PaperQuay -ErrorAction SilentlyContinue).Path
+foreach ($previous in Get-ChildItem -LiteralPath $artifactRoot.FullName -Directory) {
+    if ($previous.FullName -eq $currentExe.DirectoryName -or
+        $previous.Name -notmatch '^PaperQuay-(\d+\.\d+\.\d+|portable|win-x64)$' -or
+        ($previous.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+
+    $previousExe = Get-Item -LiteralPath (Join-Path $previous.FullName 'PaperQuay.exe') -ErrorAction SilentlyContinue
+    $previousVersion = $null
+    if (!$previousExe -or ($previousExe.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        $previousExe.VersionInfo.ProductName -ne 'PaperQuay' -or
+        ![version]::TryParse($previousExe.VersionInfo.FileVersion, [ref]$previousVersion) -or
+        $previousVersion -ge $currentVersion) { continue }
+
+    $previousPath = (Resolve-Path -LiteralPath $previous.FullName).ProviderPath
+    if ((Split-Path -Parent $previousPath) -ne $artifactRoot.FullName) {
+        throw "The old bundle is outside the artifacts directory. $previousPath"
+    }
+    if ($runningPaths -contains $previousExe.FullName) {
+        Write-Warning "Close $($previous.Name) to let the next publish recycle it."
+        continue
+    }
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        try {
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
+                $previousPath, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+            Write-Host "Recycled $($previous.Name)"
+            break
+        } catch {
+            if (!(Test-Path -LiteralPath $previousPath)) { break }
+            if ($attempt -eq 2) {
+                Write-Warning "Could not recycle $($previous.Name). $($_.Exception.Message)"
+            } else {
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
 }
 Write-Host "PaperQuay $version published to $bundle"

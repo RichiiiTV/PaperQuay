@@ -13,7 +13,7 @@ Review displays the analyzed pages and proposed groups together. **Show skipped 
 
 **Scan for review** and imported files create a local draft as their pages arrive. PaperQuay saves page edits and splits as you make them. After reopening the app, use **Needs a decision** to resume the draft. Use **Queue → Batch actions… → Change destination** to change where the batch will go. **Approve & file** stages the PDFs locally and delivers them when the destination is available.
 
-Choose **Clear history** to clear the list and permanently delete the saved PDFs listed in the confirmation. Files that could not be deleted stay in History for retry. Pending batches continue in **Queue**, and new deliveries appear in History. PaperQuay keeps scanner originals under its normal retention policy.
+Choose **Clear history** to clear the list and permanently delete the verified PDFs listed in the confirmation. Older PDFs without a recorded fingerprint stay in their destination folder when their history records are cleared. Changed or locked files stay in History for retry. **Open PDF** opens a verified local copy, and **Open folder** opens the folder with the saved file. Pending batches continue in **Queue**. PaperQuay keeps scanner originals under its normal retention policy.
 
 If the scanner reports a double feed or jam, reload the affected sheets and select **Retry** to continue the current batch. If a duplex capture stopped after just one side, PaperQuay opens the partial capture for review instead of assuming the next image is the missing back.
 
@@ -57,6 +57,8 @@ To build the self-contained Windows x64 bundle with its accompanying licenses, r
 ```powershell
 ./scripts/Publish.ps1
 ```
+
+After a successful publish, older PaperQuay bundles in this checkout's `artifacts` folder go to the Windows Recycle Bin. A running older version stays available until it is closed and you publish again.
 
 ## Checks
 

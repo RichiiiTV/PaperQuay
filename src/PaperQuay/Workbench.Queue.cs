@@ -521,7 +521,7 @@ internal sealed partial class Workbench
         openQueued.Visible = openDestination.Visible = batchMenuButton.Visible = !inDecisions;
         reviewNext.Visible = inDecisions;
         reviewNext.Enabled = !busy && filingQueue.Batches.Any(item => item.NeedsReview);
-        discardQueued.Enabled = !busy && issue && reviewing != (batch!.Id, selected!.Number);
+        discardQueued.Enabled = !busy && issue && CanDiscardReview(batch!.Id, selected!.Number);
         discardQueued.Visible = issue;
         openQueued.Enabled = !busy && selected?.Output?.FiledPath is not null;
         openDestination.Enabled = !busy && batch is not null;
@@ -578,27 +578,33 @@ internal sealed partial class Workbench
             await OpenAutomaticReview(batch, doc);
             return;
         }
-        if (doc.Disposition == QueueDisposition.Ready && output?.FiledPath is { } path)
+        if (doc.Disposition == QueueDisposition.Ready && output?.FiledPath is not null)
         {
             if (!LeaveCurrentReview()) return;
-            if (IsPdfPath(path) && await Task.Run(() => File.Exists(path)))
+            string snapshot;
+            try
+            {
+                snapshot = await Task.Run(() => engine.SnapshotFiledPdf(output, operation!.Token));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                await RestoreFiledOutput(batch, doc, output);
+                return;
+            }
+            try
             {
                 StartQueueReview(batch, documentNumber: null, SingleDocument(batch.Filing));
-                try
-                {
-                    await AddPages(engine.Import(path));
-                }
-                catch (IOException) when (pages.Count == 0)
-                {
-                    await RestoreFiledOutput(batch, doc, output);
-                    return;
-                }
+                await AddPages(engine.Import(snapshot));
                 if (pages.Count == 0) throw new IOException("The filed PDF contains no reviewable pages.");
                 dirty = false;
                 await PrepareBatch();
                 status.Text = "Filed PDF opened. Use Save copy to export your edits.";
             }
-            else await RestoreFiledOutput(batch, doc, output);
+            catch (IOException) when (pages.Count == 0)
+            {
+                await RestoreFiledOutput(batch, doc, output);
+            }
+            finally { DocumentEngine.DeleteScratchFile(snapshot); }
         }
     });
 
@@ -811,15 +817,11 @@ internal sealed partial class Workbench
 
     private Task OpenQueued() => Run("Opening the filed PDF…", async () =>
     {
-        if (SelectedDocument?.Output?.FiledPath is not { } file) return;
-        if (!IsPdfPath(file) || !await Task.Run(() => File.Exists(file)))
-            throw new IOException("The filed PDF is unavailable. Check the folder or whether a downstream app moved it.");
-        Process.Start(new ProcessStartInfo(file) { UseShellExecute = true });
-        status.Text = "Opened the filed PDF.";
+        if (SelectedDocument?.Output is not { FiledPath: not null } file) return;
+        var snapshot = await Task.Run(() => engine.SnapshotFiledPdf(file, operation!.Token));
+        Process.Start(new ProcessStartInfo(snapshot) { UseShellExecute = true });
+        status.Text = "Opened a verified copy of the filed PDF.";
     });
-
-    private static bool IsPdfPath(string path) => Path.IsPathFullyQualified(path) &&
-        string.Equals(Path.GetExtension(path), ".pdf", StringComparison.OrdinalIgnoreCase);
 
     private Task OpenQueuedFolder() => Run("Opening the destination…", async () =>
     {
@@ -878,19 +880,22 @@ internal sealed partial class Workbench
             status.Text = "History is already clear.";
             return;
         }
-        var paths = history.SelectMany(batch => batch.Documents).SelectMany(doc => doc.Outputs ?? [])
-            .Select(file => file.FiledPath).OfType<string>().ToArray();
-        if (paths.Length > 0 && !ConfirmHistoryDeletion(paths)) return;
+        var filed = history.SelectMany(batch => batch.Documents).SelectMany(doc => doc.Outputs ?? [])
+            .Where(file => file.FiledPath is not null).ToArray();
+        var paths = filed.Where(file => file.FiledHash is not null).Select(file => file.FiledPath!).ToArray();
+        if (paths.Length > 0 && !ConfirmHistoryDeletion(paths, filed.Length - paths.Length)) return;
 
         clearingHistory = true;
         UpdateQueueActions();
         status.Text = "Clearing history…";
         try
         {
-            var (failed, error) = await filingQueue.ClearHistory(history);
+            var (failed, error, unverified) = await filingQueue.ClearHistory(history);
             status.Text = failed > 0 ? $"Could not clear {failed} file(s) or records. {error}" :
                 filingQueue.History.Any() ? "Cleared the confirmed files. New scans are listed in History." :
                 "History cleared. Pending batches are in Queue.";
+            if (unverified > 0)
+                status.Text += $" Kept {unverified} older PDF(s) without a recorded fingerprint.";
         }
         finally
         {
@@ -899,7 +904,7 @@ internal sealed partial class Workbench
         }
     }
 
-    private bool ConfirmHistoryDeletion(string[] paths)
+    private bool ConfirmHistoryDeletion(string[] paths, int unverified)
     {
         using var dialog = new Form
         {
@@ -910,6 +915,8 @@ internal sealed partial class Workbench
         body.AutoSize = false;
         body.Padding = new Padding(12);
         AddRow(body, Caption($"Permanently delete {paths.Length} saved PDF(s) and clear History? Pending scans will continue."));
+        if (unverified > 0)
+            AddRow(body, Caption($"{unverified} older PDF(s) have no recorded fingerprint and will be kept."));
         var files = new ListBox { Dock = DockStyle.Fill, HorizontalScrollbar = true, AccessibleName = "PDFs to delete" };
         files.Items.AddRange(paths);
         AddRow(body, files, fill: true);
@@ -974,7 +981,7 @@ internal sealed partial class Workbench
             };
             if (dialog.ShowDialog(this) == DialogResult.OK)
             {
-                filingQueue.Redirect(id, dialog.SelectedPath);
+                await filingQueue.Redirect(id, dialog.SelectedPath, operation!.Token);
                 status.Text = "Future PDFs will be delivered to the new folder.";
             }
             else status.Text = "Folder change canceled.";
@@ -987,12 +994,19 @@ internal sealed partial class Workbench
         }
     });
 
+    private bool CanDiscardReview(Guid id, int number) => reviewing != (id, number) || pages.Count == 0;
+
     private Task DiscardQueued() => Run("Checking the selected document…", () =>
     {
-        if (SelectedBatch is { } id && SelectedDocument is { } document && reviewing != (id, document.Number) &&
+        if (SelectedBatch is { } id && SelectedDocument is { } document && CanDiscardReview(id, document.Number) &&
             Confirm("Discard these queued pages? They will not be filed."))
         {
             filingQueue.Discard(id, document.Number);
+            if (reviewing == (id, document.Number))
+            {
+                DisposePages();
+                UpdatePlan();
+            }
             RefreshQueue(id);
             status.Text = "The selected document was discarded.";
         }
